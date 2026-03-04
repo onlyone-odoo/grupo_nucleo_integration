@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data noupdate="1">
+        <!-- Daily trigger: once per day (e.g. 3:00) requests full sync and activates the batch cron below. -->
+        <record id="ir_cron_gruponucleo_daily_trigger" model="ir.cron">
+            <field name="name">Grupo Núcleo: Activar sync diario de catálogo</field>
+            <field name="model_id" ref="product.model_product_template"/>
+            <field name="state">code</field>
+            <field name="code">model._action_request_full_sync()</field>
+            <field name="interval_number">1</field>
+            <field name="interval_type">days</field>
+            <field name="numbercall">-1</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="active" eval="True"/>
+            <field name="priority">5</field>
+        </record>
+        <!-- Cleanup: runs every 10 min; if batch catalog cron requested deactivation (flag in ICP), deactivates it. Must be a separate cron because the batch cron cannot write itself while running. -->
+        <record id="ir_cron_gruponucleo_deactivate_catalog_if_pending" model="ir.cron">
+            <field name="name">Grupo Núcleo: Desactivar cron de lotes si corresponde</field>
+            <field name="model_id" ref="product.model_product_template"/>
+            <field name="state">code</field>
+            <field name="code">model._cron_gruponucleo_deactivate_catalog_if_pending()</field>
+            <field name="interval_number">10</field>
+            <field name="interval_type">minutes</field>
+            <field name="numbercall">-1</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="active" eval="True"/>
+            <field name="priority">20</field>
+        </record>
+        <!-- Batch worker: runs every 5 min only when sync was requested (by daily trigger). Processes 80 items per run; when catalog complete, sets "deactivate pending" flag; cleanup cron above performs the actual deactivation. Starts inactive. -->
+        <record id="ir_cron_sync_gruponucleo_catalog" model="ir.cron">
+            <field name="name">Grupo Núcleo: Lotes de sync catálogo (se activa por el trigger diario)</field>
+            <field name="model_id" ref="product.model_product_template"/>
+            <field name="state">code</field>
+            <field name="code">model._cron_sync_gruponucleo_catalog()</field>
+            <field name="interval_number">5</field>
+            <field name="interval_type">minutes</field>
+            <field name="numbercall">-1</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="active" eval="False"/>
+            <field name="priority">10</field>
+        </record>
+        <!-- Price/stock trigger: every 12h (or 6h) requests sync and activates the price/stock batch cron below. -->
+        <record id="ir_cron_gruponucleo_price_stock_trigger" model="ir.cron">
+            <field name="name">Grupo Núcleo: Activar sync precio y stock</field>
+            <field name="model_id" ref="product.model_product_template"/>
+            <field name="state">code</field>
+            <field name="code">model._action_request_price_stock_sync()</field>
+            <field name="interval_number">12</field>
+            <field name="interval_type">hours</field>
+            <field name="numbercall">-1</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="active" eval="True"/>
+            <field name="priority">7</field>
+        </record>
+        <!-- Price/stock batch: runs every 5 min only when requested by trigger above. When complete, sets deactivate pending; cleanup cron deactivates it. Starts inactive. -->
+        <record id="ir_cron_sync_gruponucleo_price_stock" model="ir.cron">
+            <field name="name">Grupo Núcleo: Lotes de sync precio y stock</field>
+            <field name="model_id" ref="product.model_product_template"/>
+            <field name="state">code</field>
+            <field name="code">model._cron_sync_gruponucleo_price_stock()</field>
+            <field name="interval_number">5</field>
+            <field name="interval_type">minutes</field>
+            <field name="numbercall">-1</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="active" eval="False"/>
+            <field name="priority">15</field>
+        </record>
+        <!-- Health check: verifica cada hora si la API GN responde. -->
+        <record id="ir_cron_gruponucleo_api_health_check" model="ir.cron">
+            <field name="name">Grupo Núcleo: Health check API</field>
+            <field name="model_id" ref="product.model_product_template"/>
+            <field name="state">code</field>
+            <field name="code">model._cron_check_gruponucleo_api_health()</field>
+            <field name="interval_number">1</field>
+            <field name="interval_type">hours</field>
+            <field name="numbercall">-1</field>
+            <field name="user_id" ref="base.user_root"/>
+            <field name="active" eval="True"/>
+            <field name="priority">25</field>
+        </record>
+    </data>
+</odoo>

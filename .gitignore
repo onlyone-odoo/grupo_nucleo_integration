@@ -1,0 +1,21 @@
+# IDE / editor
+.cursor/
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+.venv/
+venv/
+env/
+
+# Odoo
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_config_settings_view_form_gruponucleo" model="ir.ui.view">
+        <field name="name">res.config.settings.view.form.inherit.gruponucleo</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="sale.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//form" position="inside">
+                <div class="app_settings_block" data-string="Grupo Núcleo" data-key="grupo_nucleo_integration" string="Grupo Núcleo">
+                    <h2>Integración Grupo Núcleo</h2>
+                    <p class="text-muted">Credenciales y opciones para la API de Grupo Núcleo S.A.</p>
+                    <div class="row mt16 o_settings_container">
+                        <div class="col-12 col-lg-6 o_setting_box">
+                            <div class="o_setting_left_pane"/>
+                            <div class="o_setting_right_pane">
+                                <div class="content-group">
+                                    <label for="gn_api_id" string="API ID (numérico)"/>
+                                    <field name="gn_api_id" placeholder="Ej: 1107"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_username" string="Usuario"/>
+                                    <field name="gn_username" placeholder="Usuario API"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_password" string="Contraseña"/>
+                                    <field name="gn_password" password="True" placeholder="Contraseña API"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_base_url" string="URL de la API"/>
+                                    <field name="gn_base_url" placeholder="https://api.gruponucleosa.com"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_send_orders_on_confirm" string="Enviar a GN al confirmar"/>
+                                    <field name="gn_send_orders_on_confirm"/>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-12 col-lg-6 o_setting_box">
+                            <div class="o_setting_left_pane"/>
+                            <div class="o_setting_right_pane">
+                                <div class="content-group">
+                                    <label for="gn_partner_id" string="Proveedor para órdenes de compra"/>
+                                    <field name="gn_partner_id" options="{'no_create': True}"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_stock_source" string="Stock del proveedor a usar"/>
+                                    <field name="gn_stock_source"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_public_categ_parent_id" string="Categoría padre ecommerce"/>
+                                    <field name="gn_public_categ_parent_id" options="{'no_create': True}"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_allow_out_of_stock_order" string="Habilitar venta sin stock"/>
+                                    <field name="gn_allow_out_of_stock_order"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_publish_stock_threshold" string="Umbral stock para publicar en tienda"/>
+                                    <field name="gn_publish_stock_threshold" placeholder="3"/>
+                                </div>
+                                <div class="content-group mt16">
+                                    <button name="action_test_gruponucleo_connection" string="Probar conexión" type="object" class="btn-link"/>
+                                    <button name="action_sync_gruponucleo_catalog" string="Sincronizar catálogo ahora" type="object" class="btn-secondary"/>
+                                </div>
+                                <div class="content-group mt16">
+                                    <label for="gn_api_notify_user_id" string="Usuario a notificar si la API falla"/>
+                                    <field name="gn_api_notify_user_id" options="{'no_create': True}"/>
+                                </div>
+                                <div class="content-group mt8">
+                                    <span class="text-success fw-bold" invisible="gn_api_status != 'ok'">&#9679; API OK</span>
+                                    <span class="text-danger fw-bold" invisible="gn_api_status != 'error'">&#9679; API Error</span>
+                                    <span class="text-muted" invisible="gn_api_status != 'unknown'">&#9679; Sin verificar</span>
+                                    <field name="gn_api_status" invisible="1"/>
+                                </div>
+                                <div class="content-group" invisible="gn_api_status != 'error'">
+                                    <label for="gn_api_last_error" string="Último error"/>
+                                    <field name="gn_api_last_error" readonly="1"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_api_last_check" string="Último chequeo"/>
+                                    <field name="gn_api_last_check" readonly="1"/>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </xpath>
+        </field>
+    </record>
+</odoo>

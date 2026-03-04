@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="product_template_view_form_gruponucleo" model="ir.ui.view">
+        <field name="name">product.template.form.gruponucleo</field>
+        <field name="model">product.template</field>
+        <field name="inherit_id" ref="product.product_template_form_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='invoice_policy']" position="after">
+                <field name="gn_item_id"/>
+                <field name="gn_last_sync"/>
+                <field name="is_gruponucleo_product"/>
+                <field name="stock_gn" optional="hide"/>
+                <field name="public_categ_ids" optional="hide" widget="many2many_tags"/>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="product_template_view_list_gruponucleo" model="ir.ui.view">
+        <field name="name">product.template.list.gruponucleo</field>
+        <field name="model">product.template</field>
+        <field name="inherit_id" ref="product.product_template_tree_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='name']" position="after">
+                <field name="gn_item_id" optional="show"/>
+                <field name="is_gruponucleo_product" optional="hide"/>
+                <field name="stock_gn" optional="hide"/>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="product_template_search_view_gruponucleo" model="ir.ui.view">
+        <field name="name">product.template.search.gruponucleo</field>
+        <field name="model">product.template</field>
+        <field name="inherit_id" ref="product.product_template_search_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//search" position="inside">
+                <separator/>
+                <filter string="Grupo Núcleo" name="filter_gruponucleo" domain="[('gn_item_id', '!=', False)]"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>
