@@ -21,6 +21,9 @@ GN_PRICE_STOCK_DEACTIVATE_PENDING_KEY = "grupo_nucleo_integration.price_stock_sy
 CRON_CATALOG_XML_ID = "grupo_nucleo_integration.ir_cron_sync_gruponucleo_catalog"
 CRON_PRICE_STOCK_XML_ID = "grupo_nucleo_integration.ir_cron_sync_gruponucleo_price_stock"
 
+# One-time logger for first catalog row (impuesto interno debug)
+_gn_logged_first_row = False
+
 # Keys written by "price/stock only" cron (no name, image, category, no create)
 GN_PRICE_STOCK_ONLY_KEYS = frozenset({
     "stock_gn", "volume", "gn_last_sync",
@@ -790,15 +793,72 @@ class ProductTemplate(models.Model):
                     break
                 except (TypeError, ValueError):
                     pass
+
         # Internal tax (impuesto interno): API may return it as % in "impuestos", "impuesto_interno", etc.
         impuesto_interno = 0.0
-        for key in ("impuesto_interno", "impuestos_internos", "impuestos", "internal_tax"):
+        impuesto_keys_checked = ("impuesto_interno", "impuestos_internos", "impuestos", "internal_tax")
+        for key in impuesto_keys_checked:
             if key in row and row[key] is not None:
                 try:
                     impuesto_interno = float(row[key])
                     break
                 except (TypeError, ValueError):
                     pass
+
+        # One-time detailed log for first article (impuesto interno debug)
+        global _gn_logged_first_row
+        if not _gn_logged_first_row:
+            _gn_logged_first_row = True
+            _logger.info(
+                "Grupo Núcleo API - [1 artículo] item_id=%s - Todas las claves del row: %s",
+                item_id,
+                sorted(row.keys()),
+            )
+            _logger.info(
+                "Grupo Núcleo API - [1 artículo] item_id=%s - Row completo (raw): %s",
+                item_id,
+                row,
+            )
+            tax_like = {
+                k: row[k]
+                for k in row
+                if any(
+                    x in k.lower()
+                    for x in ("impuesto", "tax", "iva", "interno")
+                )
+            }
+            _logger.info(
+                "Grupo Núcleo API - [1 artículo] item_id=%s - Claves tipo impuesto/tax/iva/interno: %s",
+                item_id,
+                tax_like,
+            )
+            values_checked = {k: row.get(k) for k in impuesto_keys_checked}
+            _logger.info(
+                "Grupo Núcleo API - [1 artículo] item_id=%s - Valores leídos (keys que usamos): %s → impuesto_interno=%.4f",
+                item_id,
+                values_checked,
+                impuesto_interno,
+            )
+            _logger.info(
+                "Grupo Núcleo API - [1 artículo] item_id=%s - precioNeto/precio keys: precio_gn=%s",
+                item_id,
+                price_gn,
+            )
+            if price_gn is not None and impuesto_interno > 0:
+                _logger.info(
+                    "Grupo Núcleo API - [1 artículo] item_id=%s - Aplicando impuesto: %.2f%% → price %s → %s",
+                    item_id,
+                    impuesto_interno,
+                    price_gn,
+                    price_gn * (1 + impuesto_interno / 100),
+                )
+            elif price_gn is not None and impuesto_interno == 0:
+                _logger.info(
+                    "Grupo Núcleo API - [1 artículo] item_id=%s - Sin impuesto interno detectado (impuesto_interno=0), precio_gn=%s",
+                    item_id,
+                    price_gn,
+                )
+
         if price_gn is not None and impuesto_interno > 0:
             price_gn_with_tax = price_gn * (1 + impuesto_interno / 100)
             _logger.debug(
