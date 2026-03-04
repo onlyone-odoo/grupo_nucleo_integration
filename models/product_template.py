@@ -26,7 +26,7 @@ _gn_logged_first_row = False
 
 # Keys written by "price/stock only" cron (no name, image, category, no create)
 GN_PRICE_STOCK_ONLY_KEYS = frozenset({
-    "stock_gn", "volume", "gn_last_sync",
+    "stock_gn", "volume", "gn_last_sync", "gn_product_code",
     "zippin_product_length", "zippin_product_width", "zippin_product_height",
     "allow_out_of_stock_order", "replenishment_cost_type",
 })
@@ -40,6 +40,12 @@ class ProductTemplate(models.Model):
         index="btree_not_null",
         copy=False,
         help="ID of this product in Grupo Núcleo catalog (used for orders and sync).",
+    )
+    gn_product_code = fields.Char(
+        string="Código Grupo Núcleo",
+        index=True,
+        copy=False,
+        help="Código alfanumérico del producto en el catálogo de Grupo Núcleo (campo 'codigo' de la API).",
     )
     gn_last_sync = fields.Datetime(
         string="Last Grupo Núcleo Sync",
@@ -365,7 +371,7 @@ class ProductTemplate(models.Model):
                         gn_partner_id,
                         price_gn,
                         usd_currency.id if usd_currency else None,
-                        product_code=full_vals.get("default_code") or product.default_code,
+                        product_code=full_vals.get("gn_product_code") or product.gn_product_code,
                     )
                     products_to_update_cost |= product
                 stats["updated"] += 1
@@ -491,13 +497,13 @@ class ProductTemplate(models.Model):
                         self._gruponucleo_update_supplierinfo(
                             product, gn_partner_id, price_gn,
                             usd_currency.id if usd_currency else None,
-                            product_code=vals.get("default_code"),
+                            product_code=vals.get("gn_product_code"),
                         )
                     stats["updated"] += 1
                     _logger.debug(
                         "Grupo Núcleo sync: updated gn_item_id=%s [%s]",
                         item_id,
-                        product.default_code or product.name or "-",
+                        product.gn_product_code or product.name or "-",
                     )
                 else:
                     try:
@@ -506,7 +512,7 @@ class ProductTemplate(models.Model):
                             self._gruponucleo_update_supplierinfo(
                                 product, gn_partner_id, price_gn,
                                 usd_currency.id if usd_currency else None,
-                                product_code=vals.get("default_code"),
+                                product_code=vals.get("gn_product_code"),
                             )
                         stats["created"] += 1
                         _logger.debug(
@@ -524,7 +530,7 @@ class ProductTemplate(models.Model):
                                     self._gruponucleo_update_supplierinfo(
                                         product, gn_partner_id, price_gn,
                                         usd_currency.id if usd_currency else None,
-                                        product_code=vals.get("default_code"),
+                                        product_code=vals.get("gn_product_code"),
                                     )
                                 stats["barcode_fallback"] += 1
                                 _logger.debug(
@@ -612,7 +618,7 @@ class ProductTemplate(models.Model):
 
     def _find_product_for_gruponucleo_row(self, product_model, row, item_id):
         """
-        Find existing product.template to update: by gn_item_id, then barcode, then default_code.
+        Find existing product.template to update: by gn_item_id, then barcode, then gn_product_code.
         Returns record or empty recordset.
         """
         product = product_model.search([("gn_item_id", "=", item_id)], limit=1)
@@ -631,7 +637,7 @@ class ProductTemplate(models.Model):
             or str(item_id)
         )
         if code:
-            product = product_model.search([("default_code", "=", code)], limit=1)
+            product = product_model.search([("gn_product_code", "=", code)], limit=1)
             if product:
                 return product
         return product_model
@@ -880,7 +886,7 @@ class ProductTemplate(models.Model):
             price_gn = price_gn_with_tax
         vals = {
             "name": name,
-            "default_code": code,
+            "gn_product_code": code,
             "gn_last_sync": fields.Datetime.now(),
             "replenishment_cost_type": "supplier_price",
         }

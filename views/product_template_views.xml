@@ -7,6 +7,7 @@
         <field name="arch" type="xml">
             <xpath expr="//field[@name='invoice_policy']" position="after">
                 <field name="gn_item_id"/>
+                <field name="gn_product_code"/>
                 <field name="gn_last_sync"/>
                 <field name="is_gruponucleo_product"/>
                 <field name="stock_gn" optional="hide"/>
@@ -22,6 +23,7 @@
         <field name="arch" type="xml">
             <xpath expr="//field[@name='name']" position="after">
                 <field name="gn_item_id" optional="show"/>
+                <field name="gn_product_code" optional="show"/>
                 <field name="is_gruponucleo_product" optional="hide"/>
                 <field name="stock_gn" optional="hide"/>
             </xpath>
