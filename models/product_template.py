@@ -800,22 +800,25 @@ class ProductTemplate(models.Model):
                 except (TypeError, ValueError):
                     pass
 
-        # Taxes: API returns "impuestos" as list of dicts [{"imp_desc": "IVA 21%", "imp_porcentaje": 21.0}, ...].
-        # Sum all imp_porcentaje and apply to net price. Fallback to scalar keys if no list.
-        impuesto_pct = 0.0
-        if row.get("impuestos") and isinstance(row["impuestos"], list):
+        # For supplier cost we only apply IMPUESTO INTERNO (e.g. 10.5%), not IVA (21%).
+        # API may return "impuestos" as list [{"imp_desc": "IVA 21%", "imp_porcentaje": 21}, {"imp_desc": "Imp. Interno 10.5%", "imp_porcentaje": 10.5}].
+        # We must not sum both; cost = base * (1 + interno%), e.g. 80.79 * 1.105 = 89.27 USD.
+        impuesto_interno_pct = 0.0
+        for key in ("impuesto_interno", "impuestos_internos", "internal_tax"):
+            if key in row and row[key] is not None:
+                try:
+                    impuesto_interno_pct = float(row[key])
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if impuesto_interno_pct == 0.0 and row.get("impuestos") and isinstance(row["impuestos"], list):
             for item in row["impuestos"]:
-                if isinstance(item, dict) and item.get("imp_porcentaje") is not None:
+                if not isinstance(item, dict) or item.get("imp_porcentaje") is None:
+                    continue
+                desc = (item.get("imp_desc") or item.get("desc") or "").lower()
+                if "interno" in desc or "internal" in desc:
                     try:
-                        impuesto_pct += float(item["imp_porcentaje"])
-                    except (TypeError, ValueError):
-                        pass
-        if impuesto_pct == 0.0:
-            for key in ("impuesto_interno", "impuestos_internos", "internal_tax"):
-                if key in row and row[key] is not None:
-                    try:
-                        impuesto_pct = float(row[key])
-                        break
+                        impuesto_interno_pct += float(item["imp_porcentaje"])
                     except (TypeError, ValueError):
                         pass
         impuesto_keys_checked = ("impuesto_interno", "impuestos_internos", "impuestos", "internal_tax")
@@ -849,36 +852,36 @@ class ProductTemplate(models.Model):
             )
             values_checked = {k: row.get(k) for k in impuesto_keys_checked}
             _logger.info(
-                "Grupo Núcleo API - [1 artículo] item_id=%s - Valores leídos (keys que usamos): %s → impuesto_pct=%.4f",
+                "Grupo Núcleo API - [1 artículo] item_id=%s - Valores leídos (keys que usamos): %s → impuesto_interno_pct=%.4f",
                 item_id,
                 values_checked,
-                impuesto_pct,
+                impuesto_interno_pct,
             )
             _logger.info(
                 "Grupo Núcleo API - [1 artículo] item_id=%s - precioNeto/precio keys: precio_gn=%s",
                 item_id,
                 price_gn,
             )
-            if price_gn is not None and impuesto_pct > 0:
+            if price_gn is not None and impuesto_interno_pct > 0:
                 _logger.info(
-                    "Grupo Núcleo API - [1 artículo] item_id=%s - Aplicando impuestos: %.2f%% → price %s → %s",
+                    "Grupo Núcleo API - [1 artículo] item_id=%s - Aplicando solo impuesto interno: %.2f%% → price %s → %s",
                     item_id,
-                    impuesto_pct,
+                    impuesto_interno_pct,
                     price_gn,
-                    price_gn * (1 + impuesto_pct / 100),
+                    price_gn * (1 + impuesto_interno_pct / 100),
                 )
-            elif price_gn is not None and impuesto_pct == 0:
+            elif price_gn is not None and impuesto_interno_pct == 0:
                 _logger.info(
-                    "Grupo Núcleo API - [1 artículo] item_id=%s - Sin impuestos detectados (impuesto_pct=0), precio_gn=%s",
+                    "Grupo Núcleo API - [1 artículo] item_id=%s - Sin impuesto interno (impuesto_interno_pct=0), precio_gn=%s",
                     item_id,
                     price_gn,
                 )
 
-        if price_gn is not None and impuesto_pct > 0:
-            price_gn_with_tax = price_gn * (1 + impuesto_pct / 100)
+        if price_gn is not None and impuesto_interno_pct > 0:
+            price_gn_with_tax = price_gn * (1 + impuesto_interno_pct / 100)
             _logger.debug(
-                "Grupo Núcleo sync: impuestos %.2f%% on item_id=%s, price %s → %s",
-                impuesto_pct,
+                "Grupo Núcleo sync: solo impuesto interno %.2f%% on item_id=%s, price %s → %s",
+                impuesto_interno_pct,
                 item_id,
                 price_gn,
                 price_gn_with_tax,
