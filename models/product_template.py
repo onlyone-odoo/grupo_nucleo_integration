@@ -525,19 +525,46 @@ class ProductTemplate(models.Model):
                                 ProductTemplate, self._gruponucleo_row_barcode(row)
                             )
                             if product:
-                                product.write(vals)
-                                if gn_partner_id and price_gn is not None:
-                                    self._gruponucleo_update_supplierinfo(
-                                        product, gn_partner_id, price_gn,
-                                        usd_currency.id if usd_currency else None,
-                                        product_code=vals.get("gn_product_code"),
-                                    )
-                                stats["barcode_fallback"] += 1
-                                _logger.debug(
-                                    "Grupo Núcleo sync: barcode conflict gn_item_id=%s -> product id=%s",
-                                    item_id,
-                                    product.id,
+                                code_str = (
+                                    str(
+                                        row.get("codigo")
+                                        or row.get("code")
+                                        or row.get("sku")
+                                        or row.get("default_code")
+                                        or item_id
+                                    ).strip()
                                 )
+                                default_code = (product.default_code or "").strip()
+                                skip = (
+                                    product.gn_item_id and product.gn_item_id != item_id
+                                ) or (
+                                    default_code
+                                    and code_str
+                                    and default_code != code_str
+                                )
+                                if skip:
+                                    _logger.warning(
+                                        "Grupo Núcleo sync: barcode conflict but skip update item_id=%s product id=%s default_code=%s codigo=%s (avoid overwrite).",
+                                        item_id,
+                                        product.id,
+                                        default_code or "-",
+                                        code_str or "-",
+                                    )
+                                    stats["skipped"] += 1
+                                else:
+                                    product.write(vals)
+                                    if gn_partner_id and price_gn is not None:
+                                        self._gruponucleo_update_supplierinfo(
+                                            product, gn_partner_id, price_gn,
+                                            usd_currency.id if usd_currency else None,
+                                            product_code=vals.get("gn_product_code"),
+                                        )
+                                    stats["barcode_fallback"] += 1
+                                    _logger.debug(
+                                        "Grupo Núcleo sync: barcode conflict gn_item_id=%s -> product id=%s",
+                                        item_id,
+                                        product.id,
+                                    )
                             else:
                                 raise
                         else:
@@ -618,17 +645,20 @@ class ProductTemplate(models.Model):
 
     def _find_product_for_gruponucleo_row(self, product_model, row, item_id):
         """
-        Find existing product.template to update: by gn_item_id, then barcode, then gn_product_code.
-        Returns record or empty recordset.
+        Find existing product.template to update: only by gn_item_id or by barcode (with safeguard).
+
+        We do NOT match by gn_product_code/codigo to avoid overwriting a local product that
+        happens to share the same internal reference as a different GN article (e.g. JCK camera
+        ref 8310 overwritten by GN Brother tape codigo 8310). Matching by code was removed.
+
+        - gn_item_id: product already linked to this GN item → safe to update.
+        - barcode: only consider a match when the product's default_code matches the API code,
+          to avoid rare coincidences (same barcode, different article). If the product already
+          has a different gn_item_id, we do not use it.
         """
         product = product_model.search([("gn_item_id", "=", item_id)], limit=1)
         if product:
             return product
-        barcode = self._gruponucleo_row_barcode(row)
-        if barcode:
-            product = self._find_product_by_barcode(product_model, barcode)
-            if product:
-                return product
         code = (
             row.get("codigo")
             or row.get("code")
@@ -636,9 +666,25 @@ class ProductTemplate(models.Model):
             or row.get("default_code")
             or str(item_id)
         )
-        if code:
-            product = product_model.search([("gn_product_code", "=", code)], limit=1)
+        code_str = str(code).strip() if code is not None else ""
+        barcode = self._gruponucleo_row_barcode(row)
+        if barcode:
+            product = self._find_product_by_barcode(product_model, barcode)
             if product:
+                # Already linked to another GN item: do not reassign (avoid overwriting).
+                if product.gn_item_id and product.gn_item_id != item_id:
+                    return product_model
+                # Safeguard: when default_code is set, it must match API code to avoid rare
+                # coincidences (same barcode, different product; or wrong link).
+                default_code = (product.default_code or "").strip()
+                if default_code and code_str and default_code != code_str:
+                    _logger.debug(
+                        "Grupo Núcleo sync: skip barcode match item_id=%s codigo=%s product default_code=%s (avoid overwrite).",
+                        item_id,
+                        code_str,
+                        default_code,
+                    )
+                    return product_model
                 return product
         return product_model
 
@@ -758,6 +804,58 @@ class ProductTemplate(models.Model):
             sub = self._gruponucleo_get_or_create_public_categ(subcategoria, main.id)
             ids.append(sub.id)
         return ids
+
+    def _gruponucleo_iva_pct_from_row(self, row):
+        """
+        Extract IVA (VAT) percentage from API row for sale taxes.
+
+        The API returns "impuestos" as a list, e.g. [{"imp_desc": "IVA 21%", "imp_porcentaje": 21},
+        {"imp_desc": "Imp. Interno 10.5%", "imp_porcentaje": 10.5}]. We need the IVA entry only
+        (customer/sale tax), not the internal tax. Returns the first IVA percentage found (21.0 or
+        10.5) or None if none found.
+        """
+        if not row.get("impuestos") or not isinstance(row["impuestos"], list):
+            return None
+        for item in row["impuestos"]:
+            if not isinstance(item, dict) or item.get("imp_porcentaje") is None:
+                continue
+            desc = (item.get("imp_desc") or item.get("desc") or "").lower()
+            if "interno" in desc or "internal" in desc:
+                continue
+            if "iva" in desc or "vat" in desc:
+                try:
+                    return float(item["imp_porcentaje"])
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    def _gruponucleo_sale_tax_ids_for_iva_pct(self, iva_pct):
+        """
+        Return account.tax ids for sale (customer) taxes matching the given IVA percentage.
+
+        Used to set product.template.taxes_id from Grupo Núcleo API data (21% or 10.5%).
+        Searches by type_tax_use='sale' and amount equal to iva_pct in current company.
+        Returns empty list if no matching tax is found (then product keeps default taxes).
+        """
+        if iva_pct is None:
+            return []
+        Tax = self.env["account.tax"].sudo()
+        amount = round(float(iva_pct), 2)
+        taxes = Tax.search([
+            ("type_tax_use", "=", "sale"),
+            ("amount", "=", amount),
+            "|",
+            ("company_id", "=", self.env.company.id),
+            ("company_id", "=", False),
+        ], limit=1)
+        if not taxes:
+            _logger.debug(
+                "Grupo Núcleo sync: no account.tax found for sale IVA %.2f%% (company=%s); product will keep default taxes.",
+                amount,
+                self.env.company.id,
+            )
+            return []
+        return taxes.ids
 
     def _gruponucleo_catalog_row_to_vals(
         self, row, item_id, usd_currency=None, stock_source="sum", parent_public_categ_id=None
@@ -991,6 +1089,12 @@ class ProductTemplate(models.Model):
             in ("1", "true", "yes")
         )
         vals["allow_out_of_stock_order"] = allow_no_stock
+        # Sale taxes (IVA): from API impuestos take the IVA entry (21% or 10.5%), not internal tax.
+        iva_pct = self._gruponucleo_iva_pct_from_row(row)
+        if iva_pct is not None:
+            tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
+            if tax_ids:
+                vals["taxes_id"] = [(6, 0, tax_ids)]
         return vals
 
     def _gruponucleo_fetch_image_b64(self, url):
