@@ -863,14 +863,43 @@ class ProductTemplate(models.Model):
             return []
         return taxes.ids
 
+    def _gruponucleo_purchase_tax_ids_for_iva_pct(self, iva_pct):
+        """
+        Return account.tax ids for purchase (supplier) taxes matching the given IVA percentage.
+
+        Used to set product.template.supplier_taxes_id so purchase taxes match sale (21% or 10.5%).
+        Searches by type_tax_use='purchase' and amount equal to iva_pct in current company.
+        Returns empty list if no matching tax is found.
+        """
+        if iva_pct is None:
+            return []
+        Tax = self.env["account.tax"].sudo()
+        amount = round(float(iva_pct), 2)
+        taxes = Tax.search([
+            ("type_tax_use", "=", "purchase"),
+            ("amount", "=", amount),
+            "|",
+            ("company_id", "=", self.env.company.id),
+            ("company_id", "=", False),
+        ], limit=1)
+        if not taxes:
+            _logger.debug(
+                "Grupo Núcleo sync: no account.tax found for purchase IVA %.2f%% (company=%s); product will keep default supplier taxes.",
+                amount,
+                self.env.company.id,
+            )
+            return []
+        return taxes.ids
+
     def _gruponucleo_sync_sale_taxes_from_api(self, catalog=None):
         """
-        Sync sale taxes (IVA) for all Grupo Núcleo products from the API catalog.
+        Sync sale and purchase taxes (IVA) for all Grupo Núcleo products from the API catalog.
 
         For each catalog item that exists in Odoo (by gn_item_id), sets
-        product.template.taxes_id according to the IVA percentage returned by the API
-        (21%% or 10.5%%). Does not assume a single rate; each product gets the rate
-        from its catalog row. Safe to run from server action or cron.
+        product.template.taxes_id and supplier_taxes_id according to the IVA percentage
+        returned by the API (21%% or 10.5%%). Purchase taxes are kept equal to sale taxes.
+        Does not assume a single rate; each product gets the rate from its catalog row.
+        Safe to run from server action or cron.
 
         :param catalog: optional pre-fetched catalog (dict or list); if None, fetches
             via get_gruponucleo_api().get_catalog().
@@ -879,18 +908,18 @@ class ProductTemplate(models.Model):
         if catalog is None:
             api_client = self.env["res.config.settings"].get_gruponucleo_api()
             if not api_client:
-                _logger.info("Grupo Núcleo sync sale taxes: API not configured.")
+                _logger.info("Grupo Núcleo sync taxes: API not configured.")
                 return {"updated": 0, "processed": 0, "reason": "no_api"}
             try:
                 catalog = api_client.get_catalog()
             except GrupNucleoAPIError as e:
-                _logger.warning("Grupo Núcleo sync sale taxes: API error %s", e)
+                _logger.warning("Grupo Núcleo sync taxes: API error %s", e)
                 return {"updated": 0, "processed": 0, "reason": "api_error"}
         items = catalog if isinstance(catalog, list) else (catalog if isinstance(catalog, dict) else [])
         if isinstance(catalog, dict) and "items" in catalog:
             items = catalog["items"]
         if not isinstance(items, list) or not items:
-            _logger.info("Grupo Núcleo sync sale taxes: empty or invalid catalog.")
+            _logger.info("Grupo Núcleo sync taxes: empty or invalid catalog.")
             return {"updated": 0, "processed": 0, "reason": "empty_catalog"}
         ProductTemplate = self.env["product.template"].with_context(active_test=False)
         updated = 0
@@ -910,16 +939,22 @@ class ProductTemplate(models.Model):
             iva_pct = self._gruponucleo_iva_pct_from_row(row)
             if iva_pct is None:
                 continue
-            tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
-            if not tax_ids:
+            sale_tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
+            purchase_tax_ids = self._gruponucleo_purchase_tax_ids_for_iva_pct(iva_pct)
+            write_vals = {}
+            if sale_tax_ids:
+                write_vals["taxes_id"] = [(6, 0, sale_tax_ids)]
+            if purchase_tax_ids:
+                write_vals["supplier_taxes_id"] = [(6, 0, purchase_tax_ids)]
+            if not write_vals:
                 continue
-            product.write({"taxes_id": [(6, 0, tax_ids)]})
+            product.write(write_vals)
             updated += 1
             if (idx + 1) % GN_SYNC_BATCH_SIZE == 0:
                 self.env.cr.commit()
         if updated:
             _logger.info(
-                "Grupo Núcleo sync sale taxes: updated %d product(s) from API (processed %d items).",
+                "Grupo Núcleo sync taxes: updated %d product(s) sale+purchase from API (processed %d items).",
                 updated,
                 len(items),
             )
@@ -1157,12 +1192,16 @@ class ProductTemplate(models.Model):
             in ("1", "true", "yes")
         )
         vals["allow_out_of_stock_order"] = allow_no_stock
-        # Sale taxes (IVA): from API impuestos take the IVA entry (21% or 10.5%), not internal tax.
+        # Sale and purchase taxes (IVA): from API impuestos take the IVA entry (21% or 10.5%), not internal tax.
+        # Keep supplier_taxes_id equal to taxes_id so purchase orders use the same rate.
         iva_pct = self._gruponucleo_iva_pct_from_row(row)
         if iva_pct is not None:
-            tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
-            if tax_ids:
-                vals["taxes_id"] = [(6, 0, tax_ids)]
+            sale_tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
+            if sale_tax_ids:
+                vals["taxes_id"] = [(6, 0, sale_tax_ids)]
+            purchase_tax_ids = self._gruponucleo_purchase_tax_ids_for_iva_pct(iva_pct)
+            if purchase_tax_ids:
+                vals["supplier_taxes_id"] = [(6, 0, purchase_tax_ids)]
         return vals
 
     def _gruponucleo_fetch_image_b64(self, url):
