@@ -108,6 +108,12 @@ class ProductTemplate(models.Model):
         try:
             catalog = api_client.get_catalog()
             _logger.info("Grupo Núcleo GetCatalog received, running one batch.")
+            # Sync sale taxes from API (21% or 10.5% per row) only at start of cycle to avoid heavy runs every 5 min.
+            items = catalog if isinstance(catalog, list) else (catalog.get("items") if isinstance(catalog, dict) else [])
+            total = len(items) if isinstance(items, list) else 0
+            offset = int(ICP.get_param(GN_SYNC_OFFSET_KEY, "0") or "0")
+            if total and (offset == 0 or offset >= total):
+                self._gruponucleo_sync_sale_taxes_from_api(catalog)
         except GrupNucleoAPIError as e:
             _logger.warning(
                 "Grupo Núcleo sync failed (API error): %s",
@@ -856,6 +862,68 @@ class ProductTemplate(models.Model):
             )
             return []
         return taxes.ids
+
+    def _gruponucleo_sync_sale_taxes_from_api(self, catalog=None):
+        """
+        Sync sale taxes (IVA) for all Grupo Núcleo products from the API catalog.
+
+        For each catalog item that exists in Odoo (by gn_item_id), sets
+        product.template.taxes_id according to the IVA percentage returned by the API
+        (21%% or 10.5%%). Does not assume a single rate; each product gets the rate
+        from its catalog row. Safe to run from server action or cron.
+
+        :param catalog: optional pre-fetched catalog (dict or list); if None, fetches
+            via get_gruponucleo_api().get_catalog().
+        :return: dict with updated, processed, reason.
+        """
+        if catalog is None:
+            api_client = self.env["res.config.settings"].get_gruponucleo_api()
+            if not api_client:
+                _logger.info("Grupo Núcleo sync sale taxes: API not configured.")
+                return {"updated": 0, "processed": 0, "reason": "no_api"}
+            try:
+                catalog = api_client.get_catalog()
+            except GrupNucleoAPIError as e:
+                _logger.warning("Grupo Núcleo sync sale taxes: API error %s", e)
+                return {"updated": 0, "processed": 0, "reason": "api_error"}
+        items = catalog if isinstance(catalog, list) else (catalog if isinstance(catalog, dict) else [])
+        if isinstance(catalog, dict) and "items" in catalog:
+            items = catalog["items"]
+        if not isinstance(items, list) or not items:
+            _logger.info("Grupo Núcleo sync sale taxes: empty or invalid catalog.")
+            return {"updated": 0, "processed": 0, "reason": "empty_catalog"}
+        ProductTemplate = self.env["product.template"].with_context(active_test=False)
+        updated = 0
+        for idx, row in enumerate(items):
+            if not isinstance(row, dict):
+                continue
+            item_id = row.get("id") or row.get("item_id") or row.get("Id")
+            if item_id is None:
+                continue
+            try:
+                item_id = int(item_id)
+            except (TypeError, ValueError):
+                continue
+            product = ProductTemplate.search([("gn_item_id", "=", item_id)], limit=1)
+            if not product:
+                continue
+            iva_pct = self._gruponucleo_iva_pct_from_row(row)
+            if iva_pct is None:
+                continue
+            tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
+            if not tax_ids:
+                continue
+            product.write({"taxes_id": [(6, 0, tax_ids)]})
+            updated += 1
+            if (idx + 1) % GN_SYNC_BATCH_SIZE == 0:
+                self.env.cr.commit()
+        if updated:
+            _logger.info(
+                "Grupo Núcleo sync sale taxes: updated %d product(s) from API (processed %d items).",
+                updated,
+                len(items),
+            )
+        return {"updated": updated, "processed": len(items), "reason": "ok"}
 
     def _gruponucleo_catalog_row_to_vals(
         self, row, item_id, usd_currency=None, stock_source="sum", parent_public_categ_id=None
