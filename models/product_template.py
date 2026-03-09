@@ -326,6 +326,13 @@ class ProductTemplate(models.Model):
             total,
             batch_size,
         )
+        _logger.info(
+            "GN [PRICE_STOCK] batch start offset=%d batch_size=%d total=%d (first row keys: %s)",
+            offset,
+            batch_size,
+            total,
+            list(batch[0].keys()) if batch and isinstance(batch[0], dict) else [],
+        )
         usd_currency = self.env.ref("base.USD", raise_if_not_found=False)
         stock_source = (ICP.get_param("grupo_nucleo_integration.gn_stock_source", "sum") or "sum").strip()
         if stock_source not in ("stock_mdp", "stock_caba", "sum"):
@@ -354,6 +361,10 @@ class ProductTemplate(models.Model):
                 continue
             product = ProductTemplate.search([("gn_item_id", "=", item_id)], limit=1)
             if not product:
+                _logger.info(
+                    "GN [PRICE_STOCK] SKIP no product item_id=%s",
+                    item_id,
+                )
                 stats["skipped"] += 1
                 continue
             try:
@@ -365,6 +376,14 @@ class ProductTemplate(models.Model):
                     parent_public_categ_id=None,
                 )
                 price_gn = full_vals.pop("_price_gn", None)
+                raw_precio = row.get("precioNeto_USD") or row.get("precio_neto") or row.get("precioNeto") or row.get("price") or row.get("precio")
+                _logger.info(
+                    "GN [PRICE_STOCK] row item_id=%s codigo=%s | API precioNeto_USD/raw=%s → price_gn_supplierinfo=%s",
+                    item_id,
+                    full_vals.get("gn_product_code") or product.gn_product_code or "-",
+                    raw_precio,
+                    price_gn,
+                )
                 vals_light = {
                     k: v for k, v in full_vals.items()
                     if k in GN_PRICE_STOCK_ONLY_KEYS
@@ -380,6 +399,22 @@ class ProductTemplate(models.Model):
                         product_code=full_vals.get("gn_product_code") or product.gn_product_code,
                     )
                     products_to_update_cost |= product
+                    _logger.info(
+                        "GN [PRICE_STOCK] UPDATED item_id=%s product_id=%s default_code=%s price_gn=%s standard_price(before)=%s",
+                        item_id,
+                        product.id,
+                        product.default_code or "-",
+                        price_gn,
+                        product.standard_price,
+                    )
+                else:
+                    _logger.info(
+                        "GN [PRICE_STOCK] item_id=%s product_id=%s | NO supplierinfo: gn_partner_id=%s price_gn=%s",
+                        item_id,
+                        product.id,
+                        gn_partner_id,
+                        price_gn,
+                    )
                 stats["updated"] += 1
             except Exception as e:
                 stats["errors"] += 1
@@ -393,7 +428,24 @@ class ProductTemplate(models.Model):
                 continue
 
         if products_to_update_cost:
+            _logger.info(
+                "GN [PRICE_STOCK] Calling _update_cost_from_replenishment_cost for %d products (ids=%s)",
+                len(products_to_update_cost),
+                products_to_update_cost.ids[:20] if len(products_to_update_cost) > 20 else products_to_update_cost.ids,
+            )
             products_to_update_cost._update_cost_from_replenishment_cost()
+            for p in products_to_update_cost[:5]:
+                _logger.info(
+                    "GN [PRICE_STOCK] after cost update product_id=%s default_code=%s standard_price=%s",
+                    p.id,
+                    p.default_code or "-",
+                    p.standard_price,
+                )
+            if len(products_to_update_cost) > 5:
+                _logger.info(
+                    "GN [PRICE_STOCK] ... and %d more products updated",
+                    len(products_to_update_cost) - 5,
+                )
 
         new_offset = offset + batch_size
         if new_offset >= total:
@@ -455,6 +507,13 @@ class ProductTemplate(models.Model):
             total,
             batch_size,
         )
+        _logger.info(
+            "GN [CATALOG] batch start offset=%d batch_size=%d total=%d (first row keys: %s)",
+            offset,
+            batch_size,
+            total,
+            list(batch[0].keys()) if batch and isinstance(batch[0], dict) else [],
+        )
         usd_currency = self.env.ref("base.USD", raise_if_not_found=False)
         stock_source = (ICP.get_param("grupo_nucleo_integration.gn_stock_source", "sum") or "sum").strip()
         if stock_source not in ("stock_mdp", "stock_caba", "sum"):
@@ -505,7 +564,25 @@ class ProductTemplate(models.Model):
                             usd_currency.id if usd_currency else None,
                             product_code=vals.get("gn_product_code"),
                         )
+                    else:
+                        _logger.info(
+                            "GN [CATALOG] item_id=%s product_id=%s default_code=%s | NO supplierinfo: gn_partner_id=%s price_gn=%s",
+                            item_id,
+                            product.id,
+                            product.default_code or "-",
+                            gn_partner_id,
+                            price_gn,
+                        )
                     stats["updated"] += 1
+                    _logger.info(
+                        "GN [CATALOG] UPDATED item_id=%s product_id=%s default_code=%s price_gn=%s supplierinfo=%s standard_price(before)=%s",
+                        item_id,
+                        product.id,
+                        product.default_code or "-",
+                        price_gn,
+                        "yes" if gn_partner_id and price_gn is not None else "no",
+                        product.standard_price,
+                    )
                     _logger.debug(
                         "Grupo Núcleo sync: updated gn_item_id=%s [%s]",
                         item_id,
@@ -521,6 +598,14 @@ class ProductTemplate(models.Model):
                                 product_code=vals.get("gn_product_code"),
                             )
                         stats["created"] += 1
+                        _logger.info(
+                            "GN [CATALOG] CREATED item_id=%s product_id=%s default_code=%s price_gn=%s supplierinfo=%s",
+                            item_id,
+                            product.id,
+                            product.default_code or "-",
+                            price_gn,
+                            "yes" if gn_partner_id and price_gn is not None else "no",
+                        )
                         _logger.debug(
                             "Grupo Núcleo sync: created gn_item_id=%s",
                             item_id,
@@ -566,6 +651,14 @@ class ProductTemplate(models.Model):
                                             product_code=vals.get("gn_product_code"),
                                         )
                                     stats["barcode_fallback"] += 1
+                                    _logger.info(
+                                        "GN [CATALOG] BARCODE_FALLBACK item_id=%s product_id=%s default_code=%s price_gn=%s supplierinfo=%s",
+                                        item_id,
+                                        product.id,
+                                        product.default_code or "-",
+                                        price_gn,
+                                        "yes" if gn_partner_id and price_gn is not None else "no",
+                                    )
                                     _logger.debug(
                                         "Grupo Núcleo sync: barcode conflict gn_item_id=%s -> product id=%s",
                                         item_id,
@@ -716,6 +809,12 @@ class ProductTemplate(models.Model):
         replenishment cost can use vendor price (e.g. cheapest or most updated).
         """
         if not product or not partner_id or price is None:
+            _logger.info(
+                "GN [supplierinfo] skip: product=%s partner_id=%s price=%s",
+                product.id if product else None,
+                partner_id,
+                price,
+            )
             return
         Supplierinfo = self.env["product.supplierinfo"].sudo()
         domain = [
@@ -733,10 +832,29 @@ class ProductTemplate(models.Model):
             vals["product_code"] = product_code
         if line:
             line.write(vals)
+            _logger.info(
+                "GN [supplierinfo] UPDATED product_id=%s default_code=%s partner_id=%s price=%s currency_id=%s product_code=%s (supplierinfo_id=%s)",
+                product.id,
+                product.default_code or "-",
+                partner_id,
+                price,
+                currency_id,
+                product_code,
+                line.id,
+            )
         else:
             vals["product_tmpl_id"] = product.id
             vals["partner_id"] = partner_id
             Supplierinfo.create(vals)
+            _logger.info(
+                "GN [supplierinfo] CREATED product_id=%s default_code=%s partner_id=%s price=%s currency_id=%s product_code=%s",
+                product.id,
+                product.default_code or "-",
+                partner_id,
+                price,
+                currency_id,
+                product_code,
+            )
 
     def _gruponucleo_get_or_create_public_categ(self, name, parent_id=False):
         """Create or return product.public.category for ecommerce (like ELIT)."""
@@ -1088,6 +1206,16 @@ class ProductTemplate(models.Model):
                 price_gn_with_tax,
             )
             price_gn = price_gn_with_tax
+        # Debug cost: log for every row the price data used for supplierinfo (API doc: https://apimanual.gruponucleo.com.ar/apign/catalogo-con-precio-y-stock)
+        raw_precio = row.get("precioNeto_USD") or row.get("precio_neto") or row.get("precioNeto") or row.get("price") or row.get("precio") or row.get("list_price")
+        _logger.info(
+            "GN [row→costo] item_id=%s codigo=%s | API precioNeto_USD/raw=%s impuesto_interno_pct=%.2f → price_gn_supplierinfo=%s",
+            item_id,
+            code,
+            raw_precio,
+            impuesto_interno_pct,
+            price_gn,
+        )
         vals = {
             "name": name,
             "gn_product_code": code,
