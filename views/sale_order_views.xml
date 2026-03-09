@@ -6,12 +6,11 @@
         <field name="inherit_id" ref="sale.view_order_form"/>
         <field name="arch" type="xml">
             <xpath expr="//field[@name='client_order_ref']" position="after">
-                <field name="gn_send_on_confirm" invisible="state != 'draft'"/>
-                <field name="gn_order_sent" readonly="1"/>
-                <field name="gn_order_ref" readonly="1"/>
+                <field name="gn_create_po_on_confirm" invisible="state != 'draft'"/>
+                <field name="gn_order_ref" readonly="1" invisible="not purchase_order_id"/>
                 <field name="gn_sync_error" readonly="1" invisible="not gn_sync_error"/>
-                <field name="purchase_order_id" readonly="1"/>
-                <button name="action_view_purchase_order_gn" type="object" string="Ver orden de compra" class="btn-link" invisible="not purchase_order_id"/>
+                <field name="purchase_order_id" readonly="1" invisible="not purchase_order_id"/>
+                <button name="action_view_purchase_order_gn" type="object" string="Ver orden de compra GN" class="btn-link" invisible="not purchase_order_id"/>
             </xpath>
         </field>
     </record>

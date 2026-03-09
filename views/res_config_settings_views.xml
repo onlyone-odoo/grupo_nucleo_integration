@@ -30,7 +30,7 @@
                                     <field name="gn_base_url" placeholder="https://api.gruponucleosa.com"/>
                                 </div>
                                 <div class="content-group">
-                                    <label for="gn_send_orders_on_confirm" string="Enviar a GN al confirmar"/>
+                                    <label for="gn_send_orders_on_confirm" string="Crear OC Grupo Núcleo al confirmar venta"/>
                                     <field name="gn_send_orders_on_confirm"/>
                                 </div>
                             </div>

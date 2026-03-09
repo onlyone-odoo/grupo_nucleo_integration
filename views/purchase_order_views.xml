@@ -8,6 +8,16 @@
             <xpath expr="//field[@name='partner_id']" position="after">
                 <field name="gn_sale_order_id" readonly="1"/>
                 <button name="action_view_sale_order_gn" type="object" string="Ver orden de venta" class="btn-link" invisible="not gn_sale_order_id"/>
+                <field name="gn_order_ref" readonly="1" invisible="not gn_order_ref"/>
+                <field name="gn_sync_error" readonly="1" invisible="not gn_sync_error"/>
+            </xpath>
+            <xpath expr="//button[@name='action_create_invoice']" position="before">
+                <button name="action_send_to_gruponucleo"
+                        type="object"
+                        string="Enviar a Grupo Núcleo"
+                        class="btn-primary"
+                        invisible="gn_order_ref or state not in ('purchase', 'done')"
+                        confirm="¿Enviar este pedido a Grupo Núcleo? Se creará el pedido en su sistema."/>
             </xpath>
         </field>
     </record>
