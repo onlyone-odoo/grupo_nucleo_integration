@@ -103,7 +103,7 @@ class ProductTemplate(models.Model):
             return
         api_client = self.env["res.config.settings"].get_gruponucleo_api()
         if not api_client:
-            _logger.info("Grupo Núcleo sync skipped: API not configured.")
+            _logger.debug("Grupo Núcleo sync skipped: API not configured.")
             return
         try:
             catalog = api_client.get_catalog()
@@ -174,7 +174,7 @@ class ProductTemplate(models.Model):
                 )
             if cron:
                 cron.write({"active": False})
-                _logger.info(
+                _logger.debug(
                     "Grupo Núcleo sync: batch catalog cron id=%s deactivated (was pending).",
                     cron.id,
                 )
@@ -208,7 +208,7 @@ class ProductTemplate(models.Model):
                 )
             if cron_ps:
                 cron_ps.write({"active": False})
-                _logger.info(
+                _logger.debug(
                     "Grupo Núcleo price/stock sync: batch cron id=%s deactivated (was pending).",
                     cron_ps.id,
                 )
@@ -261,7 +261,7 @@ class ProductTemplate(models.Model):
             return
         api_client = self.env["res.config.settings"].get_gruponucleo_api()
         if not api_client:
-            _logger.info("Grupo Núcleo price/stock sync skipped: API not configured.")
+            _logger.debug("Grupo Núcleo price/stock sync skipped: API not configured.")
             return
         try:
             catalog = api_client.get_catalog()
@@ -285,7 +285,7 @@ class ProductTemplate(models.Model):
             ICP.set_param(GN_PRICE_STOCK_REQUESTED_DATE_KEY, "")
             ICP.set_param(GN_PRICE_STOCK_DEACTIVATE_PENDING_KEY, "1")
             _logger.info(
-                "Grupo Núcleo price/stock sync: complete (total=%s). Deactivation requested; cleanup cron will deactivate shortly.",
+                "Grupo Núcleo price/stock sync: complete (total=%s). Deactivation requested.",
                 result.get("total"),
             )
         return result
@@ -297,13 +297,13 @@ class ProductTemplate(models.Model):
         Uses its own offset (GN_PRICE_STOCK_OFFSET_KEY) so it does not interfere with full sync.
         """
         if not catalog:
-            _logger.info("Grupo Núcleo price/stock sync: empty catalog.")
+            _logger.debug("Grupo Núcleo price/stock sync: empty catalog.")
             return None
         items = catalog if isinstance(catalog, list) else (catalog if isinstance(catalog, dict) else [])
         if isinstance(catalog, dict) and "items" in catalog:
             items = catalog["items"]
         if not isinstance(items, list):
-            _logger.info("Grupo Núcleo price/stock sync: catalog format not recognized.")
+            _logger.debug("Grupo Núcleo price/stock sync: catalog format not recognized.")
             return None
         total = len(items)
         ICP = self.env["ir.config_parameter"].sudo()
@@ -313,20 +313,20 @@ class ProductTemplate(models.Model):
         batch = items[offset : offset + GN_SYNC_BATCH_SIZE]
         batch_size = len(batch)
         if not batch:
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo price/stock sync: no items in batch (offset=%d, total=%d).",
                 offset,
                 total,
             )
             return None
-        _logger.info(
+        _logger.debug(
             "Grupo Núcleo price/stock sync: batch offset=%d to %d of %d (%d items).",
             offset,
             offset + batch_size,
             total,
             batch_size,
         )
-        _logger.info(
+        _logger.debug(
             "GN [PRICE_STOCK] batch start offset=%d batch_size=%d total=%d (first row keys: %s)",
             offset,
             batch_size,
@@ -361,7 +361,7 @@ class ProductTemplate(models.Model):
                 continue
             product = ProductTemplate.search([("gn_item_id", "=", item_id)], limit=1)
             if not product:
-                _logger.info(
+                _logger.debug(
                     "GN [PRICE_STOCK] SKIP no product item_id=%s",
                     item_id,
                 )
@@ -377,7 +377,7 @@ class ProductTemplate(models.Model):
                 )
                 price_gn = full_vals.pop("_price_gn", None)
                 raw_precio = row.get("precioNeto_USD") or row.get("precio_neto") or row.get("precioNeto") or row.get("price") or row.get("precio")
-                _logger.info(
+                _logger.debug(
                     "GN [PRICE_STOCK] row item_id=%s codigo=%s | API precioNeto_USD/raw=%s → price_gn_supplierinfo=%s",
                     item_id,
                     full_vals.get("gn_product_code") or product.gn_product_code or "-",
@@ -399,7 +399,7 @@ class ProductTemplate(models.Model):
                         product_code=full_vals.get("gn_product_code") or product.gn_product_code,
                     )
                     products_to_update_cost |= product
-                    _logger.info(
+                    _logger.debug(
                         "GN [PRICE_STOCK] UPDATED item_id=%s product_id=%s default_code=%s price_gn=%s standard_price(before)=%s",
                         item_id,
                         product.id,
@@ -408,7 +408,7 @@ class ProductTemplate(models.Model):
                         product.standard_price,
                     )
                 else:
-                    _logger.info(
+                    _logger.debug(
                         "GN [PRICE_STOCK] item_id=%s product_id=%s | NO supplierinfo: gn_partner_id=%s price_gn=%s",
                         item_id,
                         product.id,
@@ -428,21 +428,21 @@ class ProductTemplate(models.Model):
                 continue
 
         if products_to_update_cost:
-            _logger.info(
+            _logger.debug(
                 "GN [PRICE_STOCK] Calling _update_cost_from_replenishment_cost for %d products (ids=%s)",
                 len(products_to_update_cost),
                 products_to_update_cost.ids[:20] if len(products_to_update_cost) > 20 else products_to_update_cost.ids,
             )
             products_to_update_cost._update_cost_from_replenishment_cost()
             for p in products_to_update_cost[:5]:
-                _logger.info(
+                _logger.debug(
                     "GN [PRICE_STOCK] after cost update product_id=%s default_code=%s standard_price=%s",
                     p.id,
                     p.default_code or "-",
                     p.standard_price,
                 )
             if len(products_to_update_cost) > 5:
-                _logger.info(
+                _logger.debug(
                     "GN [PRICE_STOCK] ... and %d more products updated",
                     len(products_to_update_cost) - 5,
                 )
@@ -450,14 +450,14 @@ class ProductTemplate(models.Model):
         new_offset = offset + batch_size
         if new_offset >= total:
             new_offset = 0
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo price/stock sync batch complete. updated=%d skipped=%d errors=%d.",
                 stats["updated"],
                 stats["skipped"],
                 stats["errors"],
             )
         else:
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo price/stock sync batch done. updated=%d skipped=%d errors=%d. Next offset=%d/%d.",
                 stats["updated"],
                 stats["skipped"],
@@ -481,13 +481,13 @@ class ProductTemplate(models.Model):
         save new offset (or 0 if batch completed). Commit after batch to allow resume on next run.
         """
         if not catalog:
-            _logger.info("Grupo Núcleo sync: empty catalog, nothing to do.")
+            _logger.debug("Grupo Núcleo sync: empty catalog, nothing to do.")
             return None
         items = catalog if isinstance(catalog, list) else (catalog if isinstance(catalog, dict) else [])
         if isinstance(catalog, dict) and "items" in catalog:
             items = catalog["items"]
         if not isinstance(items, list):
-            _logger.info("Grupo Núcleo sync: catalog format not recognized, skipping.")
+            _logger.debug("Grupo Núcleo sync: catalog format not recognized, skipping.")
             return None
         total = len(items)
         ICP = self.env["ir.config_parameter"].sudo()
@@ -498,16 +498,16 @@ class ProductTemplate(models.Model):
         batch = items[offset : offset + GN_SYNC_BATCH_SIZE]
         batch_size = len(batch)
         if not batch:
-            _logger.info("Grupo Núcleo sync: no items in batch (offset=%d, total=%d).", offset, total)
+            _logger.debug("Grupo Núcleo sync: no items in batch (offset=%d, total=%d).", offset, total)
             return None
-        _logger.info(
+        _logger.debug(
             "Grupo Núcleo sync: batch offset=%d to %d of %d (%d items).",
             offset,
             offset + batch_size,
             total,
             batch_size,
         )
-        _logger.info(
+        _logger.debug(
             "GN [CATALOG] batch start offset=%d batch_size=%d total=%d (first row keys: %s)",
             offset,
             batch_size,
@@ -565,7 +565,7 @@ class ProductTemplate(models.Model):
                             product_code=vals.get("gn_product_code"),
                         )
                     else:
-                        _logger.info(
+                        _logger.debug(
                             "GN [CATALOG] item_id=%s product_id=%s default_code=%s | NO supplierinfo: gn_partner_id=%s price_gn=%s",
                             item_id,
                             product.id,
@@ -574,7 +574,7 @@ class ProductTemplate(models.Model):
                             price_gn,
                         )
                     stats["updated"] += 1
-                    _logger.info(
+                    _logger.debug(
                         "GN [CATALOG] UPDATED item_id=%s product_id=%s default_code=%s price_gn=%s supplierinfo=%s standard_price(before)=%s",
                         item_id,
                         product.id,
@@ -598,7 +598,7 @@ class ProductTemplate(models.Model):
                                 product_code=vals.get("gn_product_code"),
                             )
                         stats["created"] += 1
-                        _logger.info(
+                        _logger.debug(
                             "GN [CATALOG] CREATED item_id=%s product_id=%s default_code=%s price_gn=%s supplierinfo=%s",
                             item_id,
                             product.id,
@@ -651,7 +651,7 @@ class ProductTemplate(models.Model):
                                             product_code=vals.get("gn_product_code"),
                                         )
                                     stats["barcode_fallback"] += 1
-                                    _logger.info(
+                                    _logger.debug(
                                         "GN [CATALOG] BARCODE_FALLBACK item_id=%s product_id=%s default_code=%s price_gn=%s supplierinfo=%s",
                                         item_id,
                                         product.id,
@@ -682,7 +682,7 @@ class ProductTemplate(models.Model):
         new_offset = offset + batch_size
         if new_offset >= total:
             new_offset = 0
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo sync batch complete (sync finished). updated=%d created=%d barcode_fallback=%d skipped=%d errors=%d.",
                 stats["updated"],
                 stats["created"],
@@ -691,7 +691,7 @@ class ProductTemplate(models.Model):
                 stats["errors"],
             )
         else:
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo sync batch done. updated=%d created=%d barcode_fallback=%d skipped=%d errors=%d. Next offset=%d/%d.",
                 stats["updated"],
                 stats["created"],
@@ -809,7 +809,7 @@ class ProductTemplate(models.Model):
         replenishment cost can use vendor price (e.g. cheapest or most updated).
         """
         if not product or not partner_id or price is None:
-            _logger.info(
+            _logger.debug(
                 "GN [supplierinfo] skip: product=%s partner_id=%s price=%s",
                 product.id if product else None,
                 partner_id,
@@ -832,7 +832,7 @@ class ProductTemplate(models.Model):
             vals["product_code"] = product_code
         if line:
             line.write(vals)
-            _logger.info(
+            _logger.debug(
                 "GN [supplierinfo] UPDATED product_id=%s default_code=%s partner_id=%s price=%s currency_id=%s product_code=%s (supplierinfo_id=%s)",
                 product.id,
                 product.default_code or "-",
@@ -846,7 +846,7 @@ class ProductTemplate(models.Model):
             vals["product_tmpl_id"] = product.id
             vals["partner_id"] = partner_id
             Supplierinfo.create(vals)
-            _logger.info(
+            _logger.debug(
                 "GN [supplierinfo] CREATED product_id=%s default_code=%s partner_id=%s price=%s currency_id=%s product_code=%s",
                 product.id,
                 product.default_code or "-",
@@ -872,7 +872,7 @@ class ProductTemplate(models.Model):
                 "name": name,
                 "parent_id": parent_id,
             })
-            _logger.info("Grupo Núcleo sync: created ecommerce category %s", name)
+            _logger.debug("Grupo Núcleo sync: created ecommerce category %s", name)
         return categ
 
     def _gruponucleo_internal_categ_from_row(self, row):
@@ -1026,7 +1026,7 @@ class ProductTemplate(models.Model):
         if catalog is None:
             api_client = self.env["res.config.settings"].get_gruponucleo_api()
             if not api_client:
-                _logger.info("Grupo Núcleo sync taxes: API not configured.")
+                _logger.debug("Grupo Núcleo sync taxes: API not configured.")
                 return {"updated": 0, "processed": 0, "reason": "no_api"}
             try:
                 catalog = api_client.get_catalog()
@@ -1037,7 +1037,7 @@ class ProductTemplate(models.Model):
         if isinstance(catalog, dict) and "items" in catalog:
             items = catalog["items"]
         if not isinstance(items, list) or not items:
-            _logger.info("Grupo Núcleo sync taxes: empty or invalid catalog.")
+            _logger.debug("Grupo Núcleo sync taxes: empty or invalid catalog.")
             return {"updated": 0, "processed": 0, "reason": "empty_catalog"}
         ProductTemplate = self.env["product.template"].with_context(active_test=False)
         updated = 0
@@ -1071,7 +1071,7 @@ class ProductTemplate(models.Model):
             if (idx + 1) % GN_SYNC_BATCH_SIZE == 0:
                 self.env.cr.commit()
         if updated:
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo sync taxes: updated %d product(s) sale+purchase from API (processed %d items).",
                 updated,
                 len(items),
@@ -1146,12 +1146,12 @@ class ProductTemplate(models.Model):
         global _gn_logged_first_row
         if not _gn_logged_first_row:
             _gn_logged_first_row = True
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo API - [1 artículo] item_id=%s - Todas las claves del row: %s",
                 item_id,
                 sorted(row.keys()),
             )
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo API - [1 artículo] item_id=%s - Row completo (raw): %s",
                 item_id,
                 row,
@@ -1164,25 +1164,25 @@ class ProductTemplate(models.Model):
                     for x in ("impuesto", "tax", "iva", "interno")
                 )
             }
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo API - [1 artículo] item_id=%s - Claves tipo impuesto/tax/iva/interno: %s",
                 item_id,
                 tax_like,
             )
             values_checked = {k: row.get(k) for k in impuesto_keys_checked}
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo API - [1 artículo] item_id=%s - Valores leídos (keys que usamos): %s → impuesto_interno_pct=%.4f",
                 item_id,
                 values_checked,
                 impuesto_interno_pct,
             )
-            _logger.info(
+            _logger.debug(
                 "Grupo Núcleo API - [1 artículo] item_id=%s - precioNeto/precio keys: precio_gn=%s",
                 item_id,
                 price_gn,
             )
             if price_gn is not None and impuesto_interno_pct > 0:
-                _logger.info(
+                _logger.debug(
                     "Grupo Núcleo API - [1 artículo] item_id=%s - Aplicando solo impuesto interno: %.2f%% → price %s → %s",
                     item_id,
                     impuesto_interno_pct,
@@ -1190,7 +1190,7 @@ class ProductTemplate(models.Model):
                     price_gn * (1 + impuesto_interno_pct / 100),
                 )
             elif price_gn is not None and impuesto_interno_pct == 0:
-                _logger.info(
+                _logger.debug(
                     "Grupo Núcleo API - [1 artículo] item_id=%s - Sin impuesto interno (impuesto_interno_pct=0), precio_gn=%s",
                     item_id,
                     price_gn,
@@ -1208,7 +1208,7 @@ class ProductTemplate(models.Model):
             price_gn = price_gn_with_tax
         # Debug cost: log for every row the price data used for supplierinfo (API doc: https://apimanual.gruponucleo.com.ar/apign/catalogo-con-precio-y-stock)
         raw_precio = row.get("precioNeto_USD") or row.get("precio_neto") or row.get("precioNeto") or row.get("price") or row.get("precio") or row.get("list_price")
-        _logger.info(
+        _logger.debug(
             "GN [row→costo] item_id=%s codigo=%s | API precioNeto_USD/raw=%s impuesto_interno_pct=%.2f → price_gn_supplierinfo=%s",
             item_id,
             code,

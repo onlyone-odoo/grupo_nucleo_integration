@@ -102,7 +102,7 @@ class PurchaseOrder(models.Model):
         self.gn_sync_error = False
 
         if self.gn_order_ref:
-            _logger.info(
+            _logger.debug(
                 "GN send: PO %s already sent (ref=%s), skipping.",
                 self.name, self.gn_order_ref,
             )
@@ -174,7 +174,7 @@ class PurchaseOrder(models.Model):
             "gn_order_ref": order_ref or False,
             "gn_sync_error": False,
         })
-        _logger.info(
+        _logger.debug(
             "GN send: PO %s sent successfully, ref=%s",
             self.name, order_ref,
         )
