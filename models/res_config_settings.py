@@ -98,6 +98,8 @@ class ResConfigSettings(models.TransientModel):
 
     @api.depends("gn_api_id")
     def _compute_gn_api_status(self):
+        # sudo() for ir.config_parameter: required to read system params from settings/compute context
+        # (safe: no user data, only module config).
         ICP = self.env["ir.config_parameter"].sudo()
         status = ICP.get_param("grupo_nucleo_integration.api_status", "unknown")
         last_check = ICP.get_param("grupo_nucleo_integration.api_last_check", False)
@@ -111,6 +113,7 @@ class ResConfigSettings(models.TransientModel):
         """
         Build API client from current config. Returns None if credentials are missing.
         """
+        # sudo() for ir.config_parameter: safe for reading module configuration parameters.
         ICP = self.env["ir.config_parameter"].sudo()
         api_id = int(ICP.get_param("grupo_nucleo_integration.gn_api_id", "0") or "0")
         username = ICP.get_param("grupo_nucleo_integration.gn_username", "").strip()

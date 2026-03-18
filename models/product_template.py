@@ -80,6 +80,8 @@ class ProductTemplate(models.Model):
         the batch catalog cron so it runs every few minutes until the full catalog is done.
         """
         today_str = fields.Date.today().isoformat()
+        # sudo() required for ir.config_parameter.set_param and ir.cron.write in cron/system context;
+        # safe because these are system configuration and cron records, not user data.
         self.env["ir.config_parameter"].sudo().set_param(
             GN_SYNC_REQUESTED_DATE_KEY,
             today_str,
@@ -110,6 +112,9 @@ class ProductTemplate(models.Model):
             return
         try:
             catalog = api_client.get_catalog()
+            # Note: full catalog is fetched on *every* batch because the GN API GetCatalog
+            # endpoint does not support pagination/offset parameters (confirmed in API docs).
+            # Batching only limits processing to 80 items per cron run to prevent timeouts.
             _logger.info("Grupo Núcleo GetCatalog received, running one batch.")
             # Sync sale taxes from API (21% or 10.5% per row) only at start of cycle to avoid heavy runs every 5 min.
             items = catalog if isinstance(catalog, list) else (catalog.get("items") if isinstance(catalog, dict) else [])
@@ -268,6 +273,9 @@ class ProductTemplate(models.Model):
             return
         try:
             catalog = api_client.get_catalog()
+            # Note: full catalog is fetched on *every* batch because the GN API GetCatalog
+            # endpoint does not support pagination/offset parameters (confirmed in API docs).
+            # Batching only limits processing to 80 items per cron run to prevent timeouts.
             _logger.info("Grupo Núcleo price/stock sync: GetCatalog received, running one batch.")
         except GrupNucleoAPIError as e:
             _logger.warning(
@@ -468,6 +476,17 @@ class ProductTemplate(models.Model):
                 new_offset,
                 total,
             )
+
+        # Cleanup for products missing from API catalog (API only returns positive stock items)
+        if new_offset == 0:
+            current_item_ids = self._gruponucleo_extract_item_ids(items)
+            cleaned = self._gruponucleo_cleanup_missing_stock(current_item_ids)
+            if cleaned > 0:
+                _logger.info(
+                    "GN price/stock sync: cleaned up %d products with stock_gn=0",
+                    cleaned,
+                )
+
         ICP.set_param(GN_PRICE_STOCK_OFFSET_KEY, str(new_offset))
         self.env.cr.commit()
         return {
@@ -819,6 +838,8 @@ class ProductTemplate(models.Model):
                 price,
             )
             return
+        # sudo() on product.supplierinfo: ensures create/write access during automated sync/cron;
+        # safe as it only affects GN supplier prices, not sensitive data.
         Supplierinfo = self.env["product.supplierinfo"].sudo()
         domain = [
             ("product_tmpl_id", "=", product.id),
@@ -966,6 +987,8 @@ class ProductTemplate(models.Model):
         """
         if iva_pct is None:
             return []
+        # sudo() on account.tax: ensures search works in cron/sync context without tax perms issues;
+        # safe as it only reads standard tax records by amount/type.
         Tax = self.env["account.tax"].sudo()
         amount = round(float(iva_pct), 2)
         taxes = Tax.search([
@@ -994,6 +1017,8 @@ class ProductTemplate(models.Model):
         """
         if iva_pct is None:
             return []
+        # sudo() on account.tax: ensures search works in cron/sync context without tax perms issues;
+        # safe as it only reads standard tax records by amount/type.
         Tax = self.env["account.tax"].sudo()
         amount = round(float(iva_pct), 2)
         taxes = Tax.search([
@@ -1476,3 +1501,60 @@ class ProductTemplate(models.Model):
             ),
             subject=_("Grupo Núcleo API: Error de conexión"),
         )
+
+    def _gruponucleo_extract_item_ids(self, items):
+        """Extract set of valid GN item_ids from a list of catalog rows.
+
+        Used to identify which GN products are missing from the current API
+        response for stock cleanup.
+        """
+        item_ids = set()
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            for key in ("id", "item_id", "Id", "itemID"):
+                val = row.get(key)
+                if val is not None:
+                    try:
+                        item_id = int(val)
+                        if item_id > 0:
+                            item_ids.add(item_id)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+        return item_ids
+
+    @api.model
+    def _gruponucleo_cleanup_missing_stock(self, current_item_ids):
+        """Set stock_gn=0 for GN products not present in the current API catalog.
+
+        Per API documentation, GetCatalog only includes products with positive
+        stock. Absence of a previously synced GN product means it is now
+        out of stock.
+
+        Uses bulk search + write for efficiency. Only called on completing
+        sync batches.
+        """
+        if not current_item_ids or len(current_item_ids) == 0:
+            return 0
+
+        current_list = [iid for iid in current_item_ids if isinstance(iid, int)]
+        domain = [
+            ("gn_item_id", "not in", current_list),
+            ("gn_item_id", "!=", False),
+            ("gn_item_id", "!=", 0),
+        ]
+        missing_products = self.search(domain)
+        if not missing_products:
+            return 0
+
+        now = fields.Datetime.now()
+        missing_products.write({
+            "stock_gn": 0.0,
+            "gn_last_sync": now,
+        })
+        _logger.info(
+            "Grupo Núcleo stock cleanup: set stock_gn=0 for %d missing products",
+            len(missing_products),
+        )
+        return len(missing_products)
