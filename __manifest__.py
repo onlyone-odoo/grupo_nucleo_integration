@@ -8,7 +8,7 @@
     "website": "https://onlyone.odoo.com/",
     "license": "LGPL-3",
     "category": "Inventory/Purchase",
-    "version": "17.0.2.0.0",
+    "version": "17.0.3.0.0",
     "development_status": "Production/Stable",
     "application": False,
     "installable": True,

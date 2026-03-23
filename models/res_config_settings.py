@@ -65,8 +65,8 @@ class ResConfigSettings(models.TransientModel):
         config_parameter="grupo_nucleo_integration.gn_allow_out_of_stock_order",
         help="Si está activo, los productos sincronizados de Grupo Núcleo tendrán: "
         "1) 'Permitir pedido sin stock' en la tienda (allow_out_of_stock_order) y "
-        "2) la ruta MTO (Reabastecer bajo pedido, route id=1) para que se generen "
-        "órdenes de compra al confirmar ventas. Se aplica al importar y al actualizar.",
+        "2) las rutas MTO (id=1) y Comprar (id=5) para reabastecer bajo pedido vía "
+        "orden de compra. Se aplica al importar y al actualizar.",
     )
     gn_publish_stock_threshold = fields.Integer(
         string="Umbral de stock para publicar (GN)",

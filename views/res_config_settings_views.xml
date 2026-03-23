@@ -51,8 +51,8 @@
                                     <field name="gn_public_categ_parent_id" options="{'no_create': True}"/>
                                 </div>
                                 <div class="content-group">
-                                    <label for="gn_allow_out_of_stock_order" string="Habilitar venta sin stock + MTO"/>
-                                    <div class="text-muted mb-2">Activa 'Permitir pedido sin stock' y asigna la ruta MTO a los productos GN para generar órdenes de compra al vender.</div>
+                                    <label for="gn_allow_out_of_stock_order" string="Habilitar venta sin stock + MTO y Comprar"/>
+                                    <div class="text-muted mb-2">Activa 'Permitir pedido sin stock' y asigna las rutas MTO y Comprar a los productos GN para reabastecer bajo pedido vía orden de compra.</div>
                                     <field name="gn_allow_out_of_stock_order"/>
                                 </div>
                                 <div class="content-group">

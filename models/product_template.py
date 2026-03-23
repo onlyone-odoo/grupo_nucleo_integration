@@ -24,8 +24,10 @@ CRON_PRICE_STOCK_XML_ID = "grupo_nucleo_integration.ir_cron_sync_gruponucleo_pri
 # One-time logger for first catalog row (impuesto interno debug)
 _gn_logged_first_row = False
 
-# MTO route id (Make-to-Order). In standard Odoo databases this is always id=1.
+# MTO route id (Make-to-Order). In standard Odoo databases this is typically id=1.
 GN_MTO_ROUTE_ID = 1
+# Buy route (Comprar). Standard warehouse buy route is often id=5; adjust if your DB differs.
+GN_BUY_ROUTE_ID = 5
 
 # Keys written by "price/stock only" cron (no name, image, category, no create)
 GN_PRICE_STOCK_ONLY_KEYS = frozenset({
@@ -1339,7 +1341,7 @@ class ProductTemplate(models.Model):
                 item_id,
                 list(row.keys())[:15],
             )
-        # Venta sin stock + ruta MTO: según ajuste en Grupo Núcleo
+        # Venta sin stock: MTO + Comprar juntas (MTO genera necesidad; Comprar crea la ruta de abastecimiento por OC).
         allow_no_stock = (
             self.env["ir.config_parameter"]
             .sudo()
@@ -1349,7 +1351,10 @@ class ProductTemplate(models.Model):
         )
         vals["allow_out_of_stock_order"] = allow_no_stock
         if allow_no_stock:
-            vals["route_ids"] = [(4, GN_MTO_ROUTE_ID)]
+            vals["route_ids"] = [
+                (4, GN_MTO_ROUTE_ID),
+                (4, GN_BUY_ROUTE_ID),
+            ]
         else:
             vals["route_ids"] = [(3, GN_MTO_ROUTE_ID)]
         # Sale and purchase taxes (IVA): from API impuestos take the IVA entry (21% or 10.5%), not internal tax.
