@@ -581,6 +581,8 @@ class ProductTemplate(models.Model):
                 price_gn = vals.pop("_price_gn", None)
                 product = self._find_product_for_gruponucleo_row(ProductTemplate, row, item_id)
                 if product:
+                    if not vals.get("image_1920") and product.image_1920:
+                        vals.pop("image_1920", None)
                     product.write(vals)
                     if gn_partner_id and price_gn is not None:
                         self._gruponucleo_update_supplierinfo(
@@ -667,6 +669,8 @@ class ProductTemplate(models.Model):
                                     )
                                     stats["skipped"] += 1
                                 else:
+                                    if not vals.get("image_1920") and product.image_1920:
+                                        vals.pop("image_1920", None)
                                     product.write(vals)
                                     if gn_partner_id and price_gn is not None:
                                         self._gruponucleo_update_supplierinfo(
@@ -1325,9 +1329,11 @@ class ProductTemplate(models.Model):
                 or row.get("imagen")
                 or row.get("link_imagen")
             )
+        # Only update image_1920 when a valid non-empty base64 is obtained;
+        # never clear an existing product image when the API has no image.
         if image_url and isinstance(image_url, str):
             b64 = self._gruponucleo_fetch_image_b64(image_url)
-            if b64:
+            if b64 and str(b64).strip():
                 vals["image_1920"] = b64
             else:
                 _logger.debug(
