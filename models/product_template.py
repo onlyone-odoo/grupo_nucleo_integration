@@ -865,6 +865,7 @@ class ProductTemplate(models.Model):
                 if product:
                     if not vals.get("image_1920") and product.image_1920:
                         vals.pop("image_1920", None)
+                    self._gn_strip_conflicting_barcode(vals, product, item_id=item_id)
                     product.write(vals)
                     if gn_partner_id and price_gn is not None:
                         self._gruponucleo_update_supplierinfo(
@@ -954,6 +955,11 @@ class ProductTemplate(models.Model):
                                 else:
                                     if not vals.get("image_1920") and product.image_1920:
                                         vals.pop("image_1920", None)
+                                    # Barcode may also be duplicated on a third
+                                    # product; writing it again would re-raise.
+                                    self._gn_strip_conflicting_barcode(
+                                        vals, product, item_id=item_id
+                                    )
                                     product.write(vals)
                                     if gn_partner_id and price_gn is not None:
                                         self._gruponucleo_update_supplierinfo(
@@ -1103,6 +1109,44 @@ class ProductTemplate(models.Model):
                     return product_model
                 return product
         return product_model
+
+    def _gn_strip_conflicting_barcode(self, vals, product, item_id=None):
+        """Drop barcode from vals when another product already uses it.
+
+        The API may return the same ean for two different items (or the barcode
+        may already exist on another product in the database). Writing it would
+        raise ValidationError (duplicate barcode) and abort the row on every
+        sync. We keep the rest of the update and skip only the barcode.
+        """
+        barcode = vals.get("barcode")
+        if not barcode or not product:
+            return vals
+        # sudo() on product.product: check barcode uniqueness across all companies
+        # (read-only search, safe in cron context).
+        other = (
+            self.env["product.product"]
+            .sudo()
+            .with_context(active_test=False)
+            .search(
+                [
+                    ("barcode", "=", barcode),
+                    ("product_tmpl_id", "!=", product.id),
+                ],
+                limit=1,
+            )
+        )
+        if other:
+            vals.pop("barcode", None)
+            _logger.warning(
+                "Grupo Núcleo sync: barcode %s (item_id=%s) ya asignado a otro producto "
+                "(product_id=%s, %s); se actualiza el producto %s sin modificar su barcode.",
+                barcode,
+                item_id or "-",
+                other.id,
+                other.display_name,
+                product.id,
+            )
+        return vals
 
     def _find_product_by_barcode(self, product_model, barcode):
         """Find product.template or product.product by barcode. Returns product.template."""
@@ -1717,21 +1761,28 @@ class ProductTemplate(models.Model):
                     "sticky": True,
                 },
             }
+        notif_type = "success"
         if result and isinstance(result, dict):
             s = result["stats"]
             total = result["total"]
             next_off = result["next_offset"]
             processed = s["updated"] + s["created"] + s["barcode_fallback"] + s["skipped"]
+            detail = _(
+                "updated=%d created=%d skipped=%d errors=%d"
+            ) % (s["updated"], s["created"], s["skipped"], s["errors"])
             if next_off == 0 and result.get("batch_size", 0) > 0:
                 msg = _(
-                    "Batch done: %d processed (updated=%d created=%d). Sync complete (%d total)."
-                ) % (processed, s["updated"], s["created"], total)
+                    "Batch done: %d processed (%s). Sync complete (%d total)."
+                ) % (processed, detail, total)
             elif next_off > 0:
                 msg = _(
-                    "Batch done: %d processed (updated=%d created=%d). Next offset %d/%d. Run again or wait for cron to continue."
-                ) % (processed, s["updated"], s["created"], next_off, total)
+                    "Batch done: %d processed (%s). Next offset %d/%d. Run again or wait for cron to continue."
+                ) % (processed, detail, next_off, total)
             else:
-                msg = _("Batch done: %d processed.") % processed
+                msg = _("Batch done: %d processed (%s).") % (processed, detail)
+            if s["errors"]:
+                notif_type = "warning"
+                msg += _(" Check server log for error details (search 'Grupo Núcleo sync: error').")
         else:
             msg = _("No catalog data to process (empty or already at end).")
         return {
@@ -1740,7 +1791,7 @@ class ProductTemplate(models.Model):
             "params": {
                 "title": _("Grupo Núcleo sync"),
                 "message": msg,
-                "type": "success",
+                "type": notif_type,
                 "sticky": True,
             },
         }
