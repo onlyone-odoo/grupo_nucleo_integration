@@ -43,6 +43,11 @@
                                     <field name="gn_partner_id" options="{'no_create': True}"/>
                                 </div>
                                 <div class="content-group">
+                                    <label for="gn_company_id" string="Compañía para datos de proveedor"/>
+                                    <div class="text-muted mb-2">Vacío = listas de precios de proveedor, impuestos y costos compartidos entre todas las compañías.</div>
+                                    <field name="gn_company_id" options="{'no_create': True}"/>
+                                </div>
+                                <div class="content-group">
                                     <label for="gn_stock_source" string="Stock del proveedor a usar"/>
                                     <field name="gn_stock_source"/>
                                 </div>
@@ -80,6 +85,18 @@
                                 <div class="content-group">
                                     <label for="gn_api_last_check" string="Último chequeo"/>
                                     <field name="gn_api_last_check" readonly="1"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_catalog_last_done" string="Última sync catálogo completada"/>
+                                    <field name="gn_catalog_last_done" readonly="1"/>
+                                </div>
+                                <div class="content-group">
+                                    <label for="gn_price_stock_last_done" string="Última sync precio/stock completada"/>
+                                    <field name="gn_price_stock_last_done" readonly="1"/>
+                                </div>
+                                <div class="content-group" invisible="not gn_sync_stale_info">
+                                    <span class="text-danger fw-bold">&#9679; Sync vencida:</span>
+                                    <field name="gn_sync_stale_info" readonly="1"/>
                                 </div>
                             </div>
                         </div>

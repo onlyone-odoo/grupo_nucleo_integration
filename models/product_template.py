@@ -1,6 +1,9 @@
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl.html).
 
+import gzip
+import json
 import logging
+from datetime import timedelta
 
 from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
@@ -21,13 +24,27 @@ GN_PRICE_STOCK_DEACTIVATE_PENDING_KEY = "grupo_nucleo_integration.price_stock_sy
 CRON_CATALOG_XML_ID = "grupo_nucleo_integration.ir_cron_sync_gruponucleo_catalog"
 CRON_PRICE_STOCK_XML_ID = "grupo_nucleo_integration.ir_cron_sync_gruponucleo_price_stock"
 
+# Per-cycle catalog cache (GetCatalog has no pagination; avoid re-downloading every batch run)
+GN_CATALOG_CACHE_ATTACHMENT_KEY = "grupo_nucleo_integration.catalog_cache_attachment_id"
+GN_CATALOG_CACHE_TIMESTAMP_KEY = "grupo_nucleo_integration.catalog_cache_timestamp"
+GN_CATALOG_CACHE_MAX_AGE_HOURS = 24
+GN_CATALOG_CACHE_ATTACHMENT_NAME = "gruponucleo_catalog_cache.json.gz"
+
+# Sync watchdog: last completed cycle timestamps + staleness thresholds (hours).
+# Thresholds can be overridden via ICP keys *_stale_hours.
+GN_CATALOG_LAST_DONE_KEY = "grupo_nucleo_integration.catalog_last_done"
+GN_PRICE_STOCK_LAST_DONE_KEY = "grupo_nucleo_integration.price_stock_last_done"
+GN_CATALOG_STALE_HOURS_KEY = "grupo_nucleo_integration.catalog_stale_hours"
+GN_PRICE_STOCK_STALE_HOURS_KEY = "grupo_nucleo_integration.price_stock_stale_hours"
+GN_CATALOG_STALE_HOURS_DEFAULT = 30  # daily trigger + margin
+GN_PRICE_STOCK_STALE_HOURS_DEFAULT = 26  # 12h trigger + margin
+GN_STALE_NOTIFIED_KEY = "grupo_nucleo_integration.sync_stale_notified"
+
+# Safety: reset a sync cycle stuck in progress for more than this many hours.
+GN_SYNC_MAX_CYCLE_HOURS = 48
+
 # One-time logger for first catalog row (impuesto interno debug)
 _gn_logged_first_row = False
-
-# MTO route id (Make-to-Order). In standard Odoo databases this is typically id=1.
-GN_MTO_ROUTE_ID = 1
-# Buy route (Comprar). Standard warehouse buy route is often id=5; adjust if your DB differs.
-GN_BUY_ROUTE_ID = 5
 
 # Keys written by "price/stock only" cron (no name, image, category, no create)
 GN_PRICE_STOCK_ONLY_KEYS = frozenset({
@@ -76,48 +93,262 @@ class ProductTemplate(models.Model):
         for rec in self:
             rec.is_gruponucleo_product = bool(rec.gn_item_id)
 
+    # ------------------------------------------------------------------
+    # Multi-company helpers
+    # ------------------------------------------------------------------
+
+    @api.model
+    def _gn_get_company_id(self):
+        """Return configured company id for GN supplier data, or False (shared)."""
+        # sudo() for ir.config_parameter: safe, module configuration only.
+        raw = (
+            self.env["ir.config_parameter"]
+            .sudo()
+            .get_param("grupo_nucleo_integration.gn_company_id", "")
+        ).strip()
+        try:
+            return int(raw) if raw else False
+        except (TypeError, ValueError):
+            return False
+
+    @api.model
+    def _gn_get_target_companies(self):
+        """Return companies for which GN data (taxes, costs) must be maintained.
+
+        Configured company in Settings, or all companies when not set (shared).
+        """
+        company_id = self._gn_get_company_id()
+        if company_id:
+            company = self.env["res.company"].sudo().browse(company_id)
+            if company.exists():
+                return company
+        return self.env["res.company"].sudo().search([])
+
+    @api.model
+    def _gn_update_cost_all_companies(self, products):
+        """Run replenishment cost update per company (standard_price is company-dependent)."""
+        if not products:
+            return
+        for company in self._gn_get_target_companies():
+            products.with_company(company)._update_cost_from_replenishment_cost()
+
+    @api.model
+    def _gn_route_commands(self, allow_no_stock):
+        """Return route_ids commands for GN products using xml-id refs (multi-company safe)."""
+        mto = self.env.ref("stock.route_warehouse0_mto", raise_if_not_found=False)
+        buy = self.env.ref("purchase_stock.route_warehouse0_buy", raise_if_not_found=False)
+        if allow_no_stock:
+            commands = []
+            if mto:
+                commands.append((4, mto.id))
+            if buy:
+                commands.append((4, buy.id))
+            return commands
+        return [(3, mto.id)] if mto else []
+
+    # ------------------------------------------------------------------
+    # Per-cycle catalog cache (GetCatalog has no pagination)
+    # ------------------------------------------------------------------
+
+    @api.model
+    def _gn_catalog_cache_read(self):
+        """Return cached catalog (parsed JSON) or None when missing/expired/corrupt."""
+        ICP = self.env["ir.config_parameter"].sudo()
+        ts_str = (ICP.get_param(GN_CATALOG_CACHE_TIMESTAMP_KEY) or "").strip()
+        att_id = (ICP.get_param(GN_CATALOG_CACHE_ATTACHMENT_KEY) or "").strip()
+        if not ts_str or not att_id:
+            return None
+        try:
+            ts = fields.Datetime.from_string(ts_str)
+        except ValueError:
+            return None
+        if fields.Datetime.now() - ts > timedelta(hours=GN_CATALOG_CACHE_MAX_AGE_HOURS):
+            return None
+        try:
+            attachment = self.env["ir.attachment"].sudo().browse(int(att_id))
+        except (TypeError, ValueError):
+            return None
+        if not attachment.exists() or not attachment.raw:
+            return None
+        try:
+            return json.loads(gzip.decompress(attachment.raw).decode("utf-8"))
+        except Exception as e:
+            _logger.warning("Grupo Núcleo sync: catalog cache unreadable, refetching (%s).", e)
+            return None
+
+    @api.model
+    def _gn_catalog_cache_write(self, catalog):
+        """Store catalog JSON (gzipped) in an attachment for reuse by subsequent batch runs."""
+        ICP = self.env["ir.config_parameter"].sudo()
+        try:
+            raw = gzip.compress(json.dumps(catalog).encode("utf-8"))
+        except (TypeError, ValueError) as e:
+            _logger.warning("Grupo Núcleo sync: could not serialize catalog cache (%s).", e)
+            return
+        Attachment = self.env["ir.attachment"].sudo()
+        att_id = (ICP.get_param(GN_CATALOG_CACHE_ATTACHMENT_KEY) or "").strip()
+        attachment = Attachment.browse(int(att_id)) if att_id.isdigit() else Attachment
+        if attachment.exists():
+            attachment.write({"raw": raw})
+        else:
+            attachment = Attachment.create({
+                "name": GN_CATALOG_CACHE_ATTACHMENT_NAME,
+                "raw": raw,
+                "mimetype": "application/gzip",
+            })
+            ICP.set_param(GN_CATALOG_CACHE_ATTACHMENT_KEY, str(attachment.id))
+        ICP.set_param(
+            GN_CATALOG_CACHE_TIMESTAMP_KEY,
+            fields.Datetime.to_string(fields.Datetime.now()),
+        )
+
+    @api.model
+    def _gn_fetch_catalog(self, api_client, offset_key):
+        """Return the GN catalog for the current batch run.
+
+        On the first batch of a cycle (offset 0) the catalog is downloaded and
+        cached; subsequent batches reuse the cache to avoid re-downloading the
+        full catalog every few minutes.
+        """
+        ICP = self.env["ir.config_parameter"].sudo()
+        offset = int(ICP.get_param(offset_key, "0") or "0")
+        if offset > 0:
+            cached = self._gn_catalog_cache_read()
+            if cached is not None:
+                _logger.debug(
+                    "Grupo Núcleo sync: using cached catalog (offset=%d, key=%s).",
+                    offset,
+                    offset_key,
+                )
+                return cached
+        catalog = api_client.get_catalog()
+        self._gn_catalog_cache_write(catalog)
+        return catalog
+
+    # ------------------------------------------------------------------
+    # Sync cycle state (in-progress flag, midnight-safe)
+    # ------------------------------------------------------------------
+
+    @api.model
+    def _gn_sync_cycle_active(self, ICP, requested_key, offset_key):
+        """Return True while a sync cycle is in progress.
+
+        The trigger cron stores the cycle start datetime in ``requested_key``;
+        the batch cron keeps running while it is set, even across midnight
+        (the old ``requested == today`` check silently froze cycles at 00:00).
+        Safety net: cycles in progress for more than GN_SYNC_MAX_CYCLE_HOURS
+        are reset (flag + offset) to avoid zombie cycles.
+        """
+        requested = (ICP.get_param(requested_key) or "").strip()
+        if not requested:
+            return False
+        try:
+            # Handles both datetime strings and legacy date-only values
+            start_dt = fields.Datetime.from_string(requested)
+        except ValueError:
+            _logger.warning(
+                "Grupo Núcleo sync: invalid cycle start %r in %s, resetting flag.",
+                requested,
+                requested_key,
+            )
+            ICP.set_param(requested_key, "")
+            return False
+        if fields.Datetime.now() - start_dt > timedelta(hours=GN_SYNC_MAX_CYCLE_HOURS):
+            _logger.warning(
+                "Grupo Núcleo sync: cycle started %s exceeds %dh, resetting flag and offset (%s).",
+                requested,
+                GN_SYNC_MAX_CYCLE_HOURS,
+                requested_key,
+            )
+            ICP.set_param(requested_key, "")
+            ICP.set_param(offset_key, "0")
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Sync watchdog helpers
+    # ------------------------------------------------------------------
+
+    @api.model
+    def _gn_get_stale_syncs(self, ICP=None):
+        """Return list of (label, last_done_str) for sync types past their staleness threshold.
+
+        A sync type is considered stale only after it completed at least once
+        (no false alarms on fresh installs).
+        """
+        if ICP is None:
+            ICP = self.env["ir.config_parameter"].sudo()
+        now = fields.Datetime.now()
+        checks = [
+            (
+                _("Catálogo GN"),
+                GN_CATALOG_LAST_DONE_KEY,
+                GN_CATALOG_STALE_HOURS_KEY,
+                GN_CATALOG_STALE_HOURS_DEFAULT,
+            ),
+            (
+                _("Precio/stock GN"),
+                GN_PRICE_STOCK_LAST_DONE_KEY,
+                GN_PRICE_STOCK_STALE_HOURS_KEY,
+                GN_PRICE_STOCK_STALE_HOURS_DEFAULT,
+            ),
+        ]
+        stale = []
+        for label, last_key, hours_key, hours_default in checks:
+            last_str = (ICP.get_param(last_key) or "").strip()
+            if not last_str:
+                continue
+            try:
+                last_dt = fields.Datetime.from_string(last_str)
+            except ValueError:
+                continue
+            try:
+                max_hours = float(ICP.get_param(hours_key) or hours_default)
+            except (TypeError, ValueError):
+                max_hours = hours_default
+            if now - last_dt > timedelta(hours=max_hours):
+                stale.append((label, last_str))
+        return stale
+
     def _action_request_full_sync(self):
         """
-        Called by the daily trigger cron. Sets sync-requested date to today and activates
+        Called by the daily trigger cron. Stores the cycle start datetime and activates
         the batch catalog cron so it runs every few minutes until the full catalog is done.
         """
-        today_str = fields.Date.today().isoformat()
+        now_str = fields.Datetime.to_string(fields.Datetime.now())
         # sudo() required for ir.config_parameter.set_param and ir.cron.write in cron/system context;
         # safe because these are system configuration and cron records, not user data.
         self.env["ir.config_parameter"].sudo().set_param(
             GN_SYNC_REQUESTED_DATE_KEY,
-            today_str,
+            now_str,
         )
         try:
             self.env.ref(CRON_CATALOG_XML_ID).sudo().write({"active": True})
             _logger.info(
-                "Grupo Núcleo sync: daily trigger set requested_date=%s, batch cron activated.",
-                today_str,
+                "Grupo Núcleo sync: daily trigger set cycle start=%s, batch cron activated.",
+                now_str,
             )
         except Exception as e:
             _logger.warning("Grupo Núcleo sync: could not activate batch cron: %s", e)
 
     def _cron_sync_gruponucleo_catalog(self):
         """
-        Called by ir.cron every few minutes when sync is requested. Processes one batch per run.
-        Only runs if GN_SYNC_REQUESTED_DATE_KEY is set to today (set by daily trigger cron).
+        Called by ir.cron every few minutes while a sync cycle is in progress
+        (flag set by the daily trigger; survives midnight). Processes one batch per run.
         When the full catalog is done (next_offset == 0), clears the flag and deactivates this cron.
         """
         ICP = self.env["ir.config_parameter"].sudo()
-        requested = (ICP.get_param(GN_SYNC_REQUESTED_DATE_KEY) or "").strip()
-        today_str = fields.Date.today().isoformat()
-        if requested != today_str:
+        if not self._gn_sync_cycle_active(ICP, GN_SYNC_REQUESTED_DATE_KEY, GN_SYNC_OFFSET_KEY):
             return
         api_client = self.env["res.config.settings"].get_gruponucleo_api()
         if not api_client:
             _logger.debug("Grupo Núcleo sync skipped: API not configured.")
             return
         try:
-            catalog = api_client.get_catalog()
-            # Note: full catalog is fetched on *every* batch because the GN API GetCatalog
-            # endpoint does not support pagination/offset parameters (confirmed in API docs).
-            # Batching only limits processing to 80 items per cron run to prevent timeouts.
-            _logger.info("Grupo Núcleo GetCatalog received, running one batch.")
+            # GetCatalog has no pagination: the catalog is downloaded once per cycle
+            # (offset 0) and cached in an attachment; subsequent batch runs reuse it.
+            catalog = self._gn_fetch_catalog(api_client, GN_SYNC_OFFSET_KEY)
+            _logger.info("Grupo Núcleo catalog ready, running one batch.")
             # Sync sale taxes from API (21% or 10.5% per row) only at start of cycle to avoid heavy runs every 5 min.
             items = catalog if isinstance(catalog, list) else (catalog.get("items") if isinstance(catalog, dict) else [])
             total = len(items) if isinstance(items, list) else 0
@@ -146,6 +377,11 @@ class ProductTemplate(models.Model):
         if result is not None and (result.get("next_offset") == 0 or result.get("next_offset") == "0"):
             ICP.set_param(GN_SYNC_REQUESTED_DATE_KEY, "")
             ICP.set_param(GN_SYNC_DEACTIVATE_PENDING_KEY, "1")
+            # Watchdog: record cycle completion timestamp
+            ICP.set_param(
+                GN_CATALOG_LAST_DONE_KEY,
+                fields.Datetime.to_string(fields.Datetime.now()),
+            )
             _logger.info(
                 "Grupo Núcleo sync: catalog complete (total=%s). Deactivation requested; cleanup cron will deactivate batch cron shortly.",
                 result.get("total"),
@@ -235,20 +471,20 @@ class ProductTemplate(models.Model):
 
     def _action_request_price_stock_sync(self):
         """
-        Called by the price/stock trigger cron (e.g. every 12h). Sets sync-requested date to today
-        and activates the price/stock batch cron so it runs every few minutes until the full
-        catalog is done (then cleanup cron deactivates it).
+        Called by the price/stock trigger cron (e.g. every 12h). Stores the cycle start
+        datetime and activates the price/stock batch cron so it runs every few minutes
+        until the full catalog is done (then cleanup cron deactivates it).
         """
-        today_str = fields.Date.today().isoformat()
+        now_str = fields.Datetime.to_string(fields.Datetime.now())
         self.env["ir.config_parameter"].sudo().set_param(
             GN_PRICE_STOCK_REQUESTED_DATE_KEY,
-            today_str,
+            now_str,
         )
         try:
             self.env.ref(CRON_PRICE_STOCK_XML_ID).sudo().write({"active": True})
             _logger.info(
-                "Grupo Núcleo price/stock sync: trigger set requested_date=%s, batch cron activated.",
-                today_str,
+                "Grupo Núcleo price/stock sync: trigger set cycle start=%s, batch cron activated.",
+                now_str,
             )
         except Exception as e:
             _logger.warning(
@@ -258,27 +494,27 @@ class ProductTemplate(models.Model):
 
     def _cron_sync_gruponucleo_price_stock(self):
         """
-        Called by ir.cron every few minutes when price/stock sync is requested. Only updates
+        Called by ir.cron every few minutes while a price/stock sync cycle is in
+        progress (flag set by the trigger; survives midnight). Only updates
         existing GN products: price (supplierinfo), stock_gn, dimensions. No creates.
-        Only runs if GN_PRICE_STOCK_REQUESTED_DATE_KEY is set to today. When the full catalog
-        is done (next_offset == 0), clears the flag and sets deactivate pending; cleanup cron
-        performs the actual deactivation (same lock issue as catalog cron).
+        When the full catalog is done (next_offset == 0), clears the flag and sets
+        deactivate pending; cleanup cron performs the actual deactivation (same lock
+        issue as catalog cron).
         """
         ICP = self.env["ir.config_parameter"].sudo()
-        requested = (ICP.get_param(GN_PRICE_STOCK_REQUESTED_DATE_KEY) or "").strip()
-        today_str = fields.Date.today().isoformat()
-        if requested != today_str:
+        if not self._gn_sync_cycle_active(
+            ICP, GN_PRICE_STOCK_REQUESTED_DATE_KEY, GN_PRICE_STOCK_OFFSET_KEY
+        ):
             return
         api_client = self.env["res.config.settings"].get_gruponucleo_api()
         if not api_client:
             _logger.debug("Grupo Núcleo price/stock sync skipped: API not configured.")
             return
         try:
-            catalog = api_client.get_catalog()
-            # Note: full catalog is fetched on *every* batch because the GN API GetCatalog
-            # endpoint does not support pagination/offset parameters (confirmed in API docs).
-            # Batching only limits processing to 80 items per cron run to prevent timeouts.
-            _logger.info("Grupo Núcleo price/stock sync: GetCatalog received, running one batch.")
+            # GetCatalog has no pagination: the catalog is downloaded once per cycle
+            # (offset 0) and cached in an attachment; subsequent batch runs reuse it.
+            catalog = self._gn_fetch_catalog(api_client, GN_PRICE_STOCK_OFFSET_KEY)
+            _logger.info("Grupo Núcleo price/stock sync: catalog ready, running one batch.")
         except GrupNucleoAPIError as e:
             _logger.warning(
                 "Grupo Núcleo price/stock sync failed (API error): %s",
@@ -297,6 +533,11 @@ class ProductTemplate(models.Model):
         if result is not None and (result.get("next_offset") == 0 or result.get("next_offset") == "0"):
             ICP.set_param(GN_PRICE_STOCK_REQUESTED_DATE_KEY, "")
             ICP.set_param(GN_PRICE_STOCK_DEACTIVATE_PENDING_KEY, "1")
+            # Watchdog: record cycle completion timestamp
+            ICP.set_param(
+                GN_PRICE_STOCK_LAST_DONE_KEY,
+                fields.Datetime.to_string(fields.Datetime.now()),
+            )
             _logger.info(
                 "Grupo Núcleo price/stock sync: complete (total=%s). Deactivation requested.",
                 result.get("total"),
@@ -359,6 +600,24 @@ class ProductTemplate(models.Model):
         stats = {"updated": 0, "skipped": 0, "errors": 0}
         products_to_update_cost = self.env["product.template"]
 
+        # Bulk prefetch for the batch (avoid one search per row):
+        # gn_item_id -> template, and supplierinfo per template for the GN partner.
+        batch_item_ids = list(self._gruponucleo_extract_item_ids(batch))
+        product_map = {
+            p.gn_item_id: p
+            for p in ProductTemplate.search([("gn_item_id", "in", batch_item_ids)])
+        }
+        supplierinfo_map = {}
+        if gn_partner_id and product_map:
+            supplierinfo_map = {
+                si.product_tmpl_id.id: si
+                for si in self.env["product.supplierinfo"].sudo().search([
+                    ("partner_id", "=", gn_partner_id),
+                    ("product_tmpl_id", "in", [p.id for p in product_map.values()]),
+                ])
+            }
+        tax_cache = {}
+
         for row in batch:
             if not isinstance(row, dict):
                 stats["skipped"] += 1
@@ -372,7 +631,7 @@ class ProductTemplate(models.Model):
             except (TypeError, ValueError):
                 stats["skipped"] += 1
                 continue
-            product = ProductTemplate.search([("gn_item_id", "=", item_id)], limit=1)
+            product = product_map.get(item_id)
             if not product:
                 _logger.debug(
                     "GN [PRICE_STOCK] SKIP no product item_id=%s",
@@ -387,6 +646,7 @@ class ProductTemplate(models.Model):
                     usd_currency=usd_currency,
                     stock_source=stock_source,
                     parent_public_categ_id=None,
+                    tax_cache=tax_cache,
                 )
                 price_gn = full_vals.pop("_price_gn", None)
                 raw_precio = row.get("precioNeto_USD") or row.get("precio_neto") or row.get("precioNeto") or row.get("price") or row.get("precio")
@@ -410,6 +670,7 @@ class ProductTemplate(models.Model):
                         price_gn,
                         usd_currency.id if usd_currency else None,
                         product_code=full_vals.get("gn_product_code") or product.gn_product_code,
+                        supplierinfo_map=supplierinfo_map,
                     )
                     products_to_update_cost |= product
                     _logger.debug(
@@ -446,7 +707,7 @@ class ProductTemplate(models.Model):
                 len(products_to_update_cost),
                 products_to_update_cost.ids[:20] if len(products_to_update_cost) > 20 else products_to_update_cost.ids,
             )
-            products_to_update_cost._update_cost_from_replenishment_cost()
+            self._gn_update_cost_all_companies(products_to_update_cost)
             for p in products_to_update_cost[:5]:
                 _logger.debug(
                     "GN [PRICE_STOCK] after cost update product_id=%s default_code=%s standard_price=%s",
@@ -555,6 +816,24 @@ class ProductTemplate(models.Model):
         ProductTemplate = self.env["product.template"].with_context(active_test=False)
         stats = {"updated": 0, "created": 0, "skipped": 0, "barcode_fallback": 0, "errors": 0}
 
+        # Bulk prefetch for the batch (avoid one search per row):
+        # gn_item_id -> template, and supplierinfo per template for the GN partner.
+        batch_item_ids = list(self._gruponucleo_extract_item_ids(batch))
+        product_map = {
+            p.gn_item_id: p
+            for p in ProductTemplate.search([("gn_item_id", "in", batch_item_ids)])
+        }
+        supplierinfo_map = {}
+        if gn_partner_id and product_map:
+            supplierinfo_map = {
+                si.product_tmpl_id.id: si
+                for si in self.env["product.supplierinfo"].sudo().search([
+                    ("partner_id", "=", gn_partner_id),
+                    ("product_tmpl_id", "in", [p.id for p in product_map.values()]),
+                ])
+            }
+        tax_cache = {}
+
         for row in batch:
             if not isinstance(row, dict):
                 stats["skipped"] += 1
@@ -576,10 +855,13 @@ class ProductTemplate(models.Model):
                     usd_currency=usd_currency,
                     stock_source=stock_source,
                     parent_public_categ_id=gn_public_categ_parent_id,
+                    tax_cache=tax_cache,
                 )
                 vals["gn_item_id"] = item_id
                 price_gn = vals.pop("_price_gn", None)
-                product = self._find_product_for_gruponucleo_row(ProductTemplate, row, item_id)
+                product = self._find_product_for_gruponucleo_row(
+                    ProductTemplate, row, item_id, product_map=product_map
+                )
                 if product:
                     if not vals.get("image_1920") and product.image_1920:
                         vals.pop("image_1920", None)
@@ -589,6 +871,7 @@ class ProductTemplate(models.Model):
                             product, gn_partner_id, price_gn,
                             usd_currency.id if usd_currency else None,
                             product_code=vals.get("gn_product_code"),
+                            supplierinfo_map=supplierinfo_map,
                         )
                     else:
                         _logger.debug(
@@ -770,7 +1053,7 @@ class ProductTemplate(models.Model):
                     pass
         return 0.0
 
-    def _find_product_for_gruponucleo_row(self, product_model, row, item_id):
+    def _find_product_for_gruponucleo_row(self, product_model, row, item_id, product_map=None):
         """
         Find existing product.template to update: only by gn_item_id or by barcode (with safeguard).
 
@@ -782,8 +1065,14 @@ class ProductTemplate(models.Model):
         - barcode: only consider a match when the product's default_code matches the API code,
           to avoid rare coincidences (same barcode, different article). If the product already
           has a different gn_item_id, we do not use it.
+
+        :param product_map: optional dict {gn_item_id: template} prefetched for the
+            batch to avoid one search per row.
         """
-        product = product_model.search([("gn_item_id", "=", item_id)], limit=1)
+        if product_map is not None:
+            product = product_map.get(item_id) or product_model
+        else:
+            product = product_model.search([("gn_item_id", "=", item_id)], limit=1)
         if product:
             return product
         code = (
@@ -830,11 +1119,18 @@ class ProductTemplate(models.Model):
         return product_model
 
     def _gruponucleo_update_supplierinfo(
-        self, product, partner_id, price, currency_id=None, product_code=None
+        self, product, partner_id, price, currency_id=None, product_code=None,
+        supplierinfo_map=None,
     ):
         """
         Create or update product.supplierinfo for the GN partner so purchase and
         replenishment cost can use vendor price (e.g. cheapest or most updated).
+
+        company_id is set explicitly (configured company or False=shared) so
+        supplier pricelists are visible in all companies (multi-company support).
+
+        :param supplierinfo_map: optional dict {product_tmpl_id: supplierinfo record}
+            prefetched for the batch to avoid one search per row.
         """
         if not product or not partner_id or price is None:
             _logger.debug(
@@ -847,14 +1143,18 @@ class ProductTemplate(models.Model):
         # sudo() on product.supplierinfo: ensures create/write access during automated sync/cron;
         # safe as it only affects GN supplier prices, not sensitive data.
         Supplierinfo = self.env["product.supplierinfo"].sudo()
-        domain = [
-            ("product_tmpl_id", "=", product.id),
-            ("partner_id", "=", partner_id),
-        ]
-        line = Supplierinfo.search(domain, limit=1)
+        if supplierinfo_map is not None and product.id in supplierinfo_map:
+            line = supplierinfo_map[product.id]
+        else:
+            domain = [
+                ("product_tmpl_id", "=", product.id),
+                ("partner_id", "=", partner_id),
+            ]
+            line = Supplierinfo.search(domain, limit=1)
         vals = {
             "price": price,
             "min_qty": 1.0,
+            "company_id": self._gn_get_company_id(),
         }
         if currency_id:
             vals["currency_id"] = currency_id
@@ -983,65 +1283,59 @@ class ProductTemplate(models.Model):
                     pass
         return None
 
-    def _gruponucleo_sale_tax_ids_for_iva_pct(self, iva_pct):
+    def _gruponucleo_tax_ids_for_iva_pct(self, iva_pct, type_tax_use, tax_cache=None):
         """
-        Return account.tax ids for sale (customer) taxes matching the given IVA percentage.
+        Return account.tax ids matching the given IVA percentage, one tax per
+        target company (multi-company: the m2m holds taxes of several companies;
+        each company only sees its own in views/documents).
 
-        Used to set product.template.taxes_id from Grupo Núcleo API data (21% or 10.5%).
-        Searches by type_tax_use='sale' and amount equal to iva_pct in current company.
-        Returns empty list if no matching tax is found (then product keeps default taxes).
+        :param type_tax_use: 'sale' or 'purchase'.
+        :param tax_cache: optional dict to cache results per (type, amount) so a
+            batch performs one search per percentage instead of one per row.
+        :return: list of tax ids ([] if no matching tax in any target company).
         """
         if iva_pct is None:
             return []
+        amount = round(float(iva_pct), 2)
+        cache_key = (type_tax_use, amount)
+        if tax_cache is not None and cache_key in tax_cache:
+            return tax_cache[cache_key]
         # sudo() on account.tax: ensures search works in cron/sync context without tax perms issues;
         # safe as it only reads standard tax records by amount/type.
         Tax = self.env["account.tax"].sudo()
-        amount = round(float(iva_pct), 2)
+        company_ids = self._gn_get_target_companies().ids
         taxes = Tax.search([
-            ("type_tax_use", "=", "sale"),
+            ("type_tax_use", "=", type_tax_use),
+            ("amount_type", "=", "percent"),
             ("amount", "=", amount),
-            "|",
-            ("company_id", "=", self.env.company.id),
-            ("company_id", "=", False),
-        ], limit=1)
-        if not taxes:
+            ("company_id", "in", company_ids),
+        ])
+        # Keep one tax per company (first found, stable order by search)
+        tax_ids = []
+        seen_companies = set()
+        for tax in taxes:
+            if tax.company_id.id in seen_companies:
+                continue
+            seen_companies.add(tax.company_id.id)
+            tax_ids.append(tax.id)
+        if not tax_ids:
             _logger.debug(
-                "Grupo Núcleo sync: no account.tax found for sale IVA %.2f%% (company=%s); product will keep default taxes.",
+                "Grupo Núcleo sync: no account.tax found for %s IVA %.2f%% (companies=%s); product will keep default taxes.",
+                type_tax_use,
                 amount,
-                self.env.company.id,
+                company_ids,
             )
-            return []
-        return taxes.ids
+        if tax_cache is not None:
+            tax_cache[cache_key] = tax_ids
+        return tax_ids
 
-    def _gruponucleo_purchase_tax_ids_for_iva_pct(self, iva_pct):
-        """
-        Return account.tax ids for purchase (supplier) taxes matching the given IVA percentage.
+    def _gruponucleo_sale_tax_ids_for_iva_pct(self, iva_pct, tax_cache=None):
+        """Return sale tax ids for the IVA percentage in all target companies."""
+        return self._gruponucleo_tax_ids_for_iva_pct(iva_pct, "sale", tax_cache=tax_cache)
 
-        Used to set product.template.supplier_taxes_id so purchase taxes match sale (21% or 10.5%).
-        Searches by type_tax_use='purchase' and amount equal to iva_pct in current company.
-        Returns empty list if no matching tax is found.
-        """
-        if iva_pct is None:
-            return []
-        # sudo() on account.tax: ensures search works in cron/sync context without tax perms issues;
-        # safe as it only reads standard tax records by amount/type.
-        Tax = self.env["account.tax"].sudo()
-        amount = round(float(iva_pct), 2)
-        taxes = Tax.search([
-            ("type_tax_use", "=", "purchase"),
-            ("amount", "=", amount),
-            "|",
-            ("company_id", "=", self.env.company.id),
-            ("company_id", "=", False),
-        ], limit=1)
-        if not taxes:
-            _logger.debug(
-                "Grupo Núcleo sync: no account.tax found for purchase IVA %.2f%% (company=%s); product will keep default supplier taxes.",
-                amount,
-                self.env.company.id,
-            )
-            return []
-        return taxes.ids
+    def _gruponucleo_purchase_tax_ids_for_iva_pct(self, iva_pct, tax_cache=None):
+        """Return purchase tax ids for the IVA percentage in all target companies."""
+        return self._gruponucleo_tax_ids_for_iva_pct(iva_pct, "purchase", tax_cache=tax_cache)
 
     def _gruponucleo_sync_sale_taxes_from_api(self, catalog=None):
         """
@@ -1074,6 +1368,13 @@ class ProductTemplate(models.Model):
             _logger.debug("Grupo Núcleo sync taxes: empty or invalid catalog.")
             return {"updated": 0, "processed": 0, "reason": "empty_catalog"}
         ProductTemplate = self.env["product.template"].with_context(active_test=False)
+        # Bulk map gn_item_id -> template (avoid one search per row) and tax cache per pct
+        all_item_ids = list(self._gruponucleo_extract_item_ids(items))
+        product_map = {
+            p.gn_item_id: p
+            for p in ProductTemplate.search([("gn_item_id", "in", all_item_ids)])
+        }
+        tax_cache = {}
         updated = 0
         for idx, row in enumerate(items):
             if not isinstance(row, dict):
@@ -1085,14 +1386,14 @@ class ProductTemplate(models.Model):
                 item_id = int(item_id)
             except (TypeError, ValueError):
                 continue
-            product = ProductTemplate.search([("gn_item_id", "=", item_id)], limit=1)
+            product = product_map.get(item_id)
             if not product:
                 continue
             iva_pct = self._gruponucleo_iva_pct_from_row(row)
             if iva_pct is None:
                 continue
-            sale_tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
-            purchase_tax_ids = self._gruponucleo_purchase_tax_ids_for_iva_pct(iva_pct)
+            sale_tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct, tax_cache=tax_cache)
+            purchase_tax_ids = self._gruponucleo_purchase_tax_ids_for_iva_pct(iva_pct, tax_cache=tax_cache)
             write_vals = {}
             if sale_tax_ids:
                 write_vals["taxes_id"] = [(6, 0, sale_tax_ids)]
@@ -1113,7 +1414,8 @@ class ProductTemplate(models.Model):
         return {"updated": updated, "processed": len(items), "reason": "ok"}
 
     def _gruponucleo_catalog_row_to_vals(
-        self, row, item_id, usd_currency=None, stock_source="sum", parent_public_categ_id=None
+        self, row, item_id, usd_currency=None, stock_source="sum",
+        parent_public_categ_id=None, tax_cache=None,
     ):
         """
         Map one catalog row to product.template write/create vals.
@@ -1356,21 +1658,17 @@ class ProductTemplate(models.Model):
             in ("1", "true", "yes")
         )
         vals["allow_out_of_stock_order"] = allow_no_stock
-        if allow_no_stock:
-            vals["route_ids"] = [
-                (4, GN_MTO_ROUTE_ID),
-                (4, GN_BUY_ROUTE_ID),
-            ]
-        else:
-            vals["route_ids"] = [(3, GN_MTO_ROUTE_ID)]
+        route_commands = self._gn_route_commands(allow_no_stock)
+        if route_commands:
+            vals["route_ids"] = route_commands
         # Sale and purchase taxes (IVA): from API impuestos take the IVA entry (21% or 10.5%), not internal tax.
         # Keep supplier_taxes_id equal to taxes_id so purchase orders use the same rate.
         iva_pct = self._gruponucleo_iva_pct_from_row(row)
         if iva_pct is not None:
-            sale_tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct)
+            sale_tax_ids = self._gruponucleo_sale_tax_ids_for_iva_pct(iva_pct, tax_cache=tax_cache)
             if sale_tax_ids:
                 vals["taxes_id"] = [(6, 0, sale_tax_ids)]
-            purchase_tax_ids = self._gruponucleo_purchase_tax_ids_for_iva_pct(iva_pct)
+            purchase_tax_ids = self._gruponucleo_purchase_tax_ids_for_iva_pct(iva_pct, tax_cache=tax_cache)
             if purchase_tax_ids:
                 vals["supplier_taxes_id"] = [(6, 0, purchase_tax_ids)]
         return vals
@@ -1405,7 +1703,7 @@ class ProductTemplate(models.Model):
             }
         try:
             _logger.info("Grupo Núcleo sync: manual trigger, fetching catalog.")
-            catalog = api_client.get_catalog()
+            catalog = self._gn_fetch_catalog(api_client, GN_SYNC_OFFSET_KEY)
             result = self._sync_gruponucleo_catalog_data(catalog)
         except GrupNucleoAPIError as e:
             _logger.warning("Grupo Núcleo sync failed: %s", e)
@@ -1456,9 +1754,13 @@ class ProductTemplate(models.Model):
         """Lightweight login check to verify the GN API is alive.
 
         Updates ICP status flags and sends a Discuss notification to the
-        configured user when the status transitions to error.
+        configured user when the status transitions to error. Also acts as
+        sync watchdog: alerts when a sync cycle has not completed within its
+        staleness threshold (detects silently stalled syncs).
         """
         ICP = self.env["ir.config_parameter"].sudo()
+        # Watchdog first: must run even when the API check below returns early.
+        self._gn_check_sync_staleness(ICP)
         previous_status = ICP.get_param("grupo_nucleo_integration.api_status", "unknown")
         now_str = fields.Datetime.to_string(fields.Datetime.now())
 
@@ -1484,6 +1786,52 @@ class ProductTemplate(models.Model):
         ICP.set_param("grupo_nucleo_integration.api_last_check", now_str)
         ICP.set_param("grupo_nucleo_integration.api_last_error", "")
         _logger.info("Grupo Núcleo API health check: OK")
+
+    @api.model
+    def _gn_check_sync_staleness(self, ICP):
+        """Sync watchdog: alert when a sync cycle is past its staleness threshold.
+
+        Compares each *_last_done timestamp against its threshold (see
+        _gn_get_stale_syncs). Notifies the configured user via Discuss only on
+        transition to stale (flag in ICP avoids hourly spam); the flag clears
+        itself when syncs are fresh again so a future stall re-notifies.
+        """
+        stale = self._gn_get_stale_syncs(ICP)
+        notified = (ICP.get_param(GN_STALE_NOTIFIED_KEY) or "").strip()
+        if not stale:
+            if notified:
+                ICP.set_param(GN_STALE_NOTIFIED_KEY, "")
+            return
+        stale_labels = ", ".join(label for label, _last in stale)
+        _logger.warning(
+            "Grupo Núcleo sync watchdog: stale syncs detected: %s",
+            "; ".join("%s (última: %s)" % (label, last) for label, last in stale),
+        )
+        if notified == stale_labels:
+            return
+        ICP.set_param(GN_STALE_NOTIFIED_KEY, stale_labels)
+        notify_uid = int(
+            ICP.get_param("grupo_nucleo_integration.gn_api_notify_user_id") or 0
+        )
+        if not notify_uid:
+            return
+        user = self.env["res.users"].sudo().browse(notify_uid)
+        if not user.exists() or not user.partner_id:
+            return
+        details = "<br/>".join(
+            _("- %(sync)s: última completada %(last)s", sync=label, last=last)
+            for label, last in stale
+        )
+        self.env["mail.thread"].message_notify(
+            partner_ids=user.partner_id.ids,
+            body=_(
+                "<b>Grupo Núcleo: sincronización vencida</b><br/>"
+                "Las siguientes sincronizaciones no se completaron dentro del "
+                "umbral esperado:<br/>%s",
+                details,
+            ),
+            subject=_("Grupo Núcleo: sincronización vencida"),
+        )
 
     @api.model
     def _gn_health_set_error(self, ICP, now_str, error_msg, previous_status):

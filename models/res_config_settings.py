@@ -43,6 +43,14 @@ class ResConfigSettings(models.TransientModel):
         domain="[('supplier_rank', '>', 0)]",
         help="Partner used as supplier on purchase orders created when sending orders to GN.",
     )
+    gn_company_id = fields.Many2one(
+        "res.company",
+        string="Compañía datos GN",
+        config_parameter="grupo_nucleo_integration.gn_company_id",
+        help="Compañía para los datos de proveedor sincronizados desde Grupo Núcleo "
+        "(listas de precios de proveedor, impuestos y costos). "
+        "Vacío = compartido entre todas las compañías.",
+    )
     gn_stock_source = fields.Selection(
         [
             ("stock_mdp", "Mar del Plata (stock_mdp)"),
@@ -96,6 +104,21 @@ class ResConfigSettings(models.TransientModel):
         compute="_compute_gn_api_status",
     )
 
+    # Sync watchdog (last completed cycle per sync type)
+    gn_catalog_last_done = fields.Datetime(
+        string="Última sync catálogo GN completada",
+        compute="_compute_gn_sync_status",
+    )
+    gn_price_stock_last_done = fields.Datetime(
+        string="Última sync precio/stock GN completada",
+        compute="_compute_gn_sync_status",
+    )
+    gn_sync_stale_info = fields.Char(
+        string="Syncs GN vencidas",
+        compute="_compute_gn_sync_status",
+        help="Sincronizaciones que superaron el umbral máximo sin completarse.",
+    )
+
     @api.depends("gn_api_id")
     def _compute_gn_api_status(self):
         # sudo() for ir.config_parameter: required to read system params from settings/compute context
@@ -108,6 +131,19 @@ class ResConfigSettings(models.TransientModel):
             rec.gn_api_status = status if status in ("ok", "error") else "unknown"
             rec.gn_api_last_check = last_check or False
             rec.gn_api_last_error = last_error or False
+
+    @api.depends("gn_api_id")
+    def _compute_gn_sync_status(self):
+        # sudo() for ir.config_parameter: safe, only module config flags.
+        ICP = self.env["ir.config_parameter"].sudo()
+        catalog_last = ICP.get_param("grupo_nucleo_integration.catalog_last_done", False)
+        price_stock_last = ICP.get_param("grupo_nucleo_integration.price_stock_last_done", False)
+        stale = self.env["product.template"]._gn_get_stale_syncs(ICP)
+        stale_info = ", ".join(label for label, _last in stale) if stale else False
+        for rec in self:
+            rec.gn_catalog_last_done = catalog_last or False
+            rec.gn_price_stock_last_done = price_stock_last or False
+            rec.gn_sync_stale_info = stale_info
 
     def get_gruponucleo_api(self) -> GrupNucleoAPI | None:
         """
