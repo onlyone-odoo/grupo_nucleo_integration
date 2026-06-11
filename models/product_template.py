@@ -48,7 +48,7 @@ _gn_logged_first_row = False
 
 # Keys written by "price/stock only" cron (no name, image, category, no create)
 GN_PRICE_STOCK_ONLY_KEYS = frozenset({
-    "stock_gn", "volume", "gn_last_sync", "gn_product_code",
+    "stock_gn", "volume", "gn_last_sync", "gn_product_code", "gn_raw_data",
     "zippin_product_length", "zippin_product_width", "zippin_product_height",
     "allow_out_of_stock_order", "route_ids", "replenishment_cost_type",
 })
@@ -86,6 +86,21 @@ class ProductTemplate(models.Model):
         readonly=True,
         help="Supplier stock from Grupo Núcleo (source depends on Settings: MDP, CABA or sum). Used for filters/crons, not inventory moves.",
     )
+    gn_raw_data = fields.Text(
+        string="Raw data API GN",
+        readonly=True,
+        copy=False,
+        help="Último JSON crudo recibido de la API de Grupo Núcleo para este producto "
+        "(se actualiza en cada sincronización). Útil para auditar precios e impuestos.",
+    )
+
+    @api.model
+    def _gn_dump_raw_data(self, row):
+        """Serialize an API catalog row to pretty JSON for gn_raw_data."""
+        try:
+            return json.dumps(row, indent=2, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(row)
 
     @api.depends("gn_item_id")
     def _compute_is_gruponucleo_product(self):
@@ -1601,6 +1616,7 @@ class ProductTemplate(models.Model):
             "gn_product_code": code,
             "gn_last_sync": fields.Datetime.now(),
             "replenishment_cost_type": "supplier_price",
+            "gn_raw_data": self._gn_dump_raw_data(row),
         }
         # Descripción de ventas (item_desc_0); Descripción eCommerce (item_desc_1 + item_desc_2)
         desc_0 = (row.get("item_desc_0") or "").strip()

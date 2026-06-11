@@ -13,6 +13,15 @@
                 <field name="stock_gn" optional="hide"/>
                 <field name="public_categ_ids" optional="hide" widget="many2many_tags"/>
             </xpath>
+            <!-- Raw data de la API (auditoría de precios/impuestos) -->
+            <xpath expr="//notebook" position="inside">
+                <page string="Grupo Núcleo API" name="gn_api_raw" invisible="not is_gruponucleo_product">
+                    <group>
+                        <field name="gn_last_sync" readonly="1"/>
+                    </group>
+                    <field name="gn_raw_data" readonly="1" widget="text" nolabel="1"/>
+                </page>
+            </xpath>
         </field>
     </record>
 
