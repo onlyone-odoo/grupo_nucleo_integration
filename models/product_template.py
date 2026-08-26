@@ -1979,6 +1979,9 @@ class ProductTemplate(models.Model):
             "stock_gn": 0.0,
             "gn_last_sync": now,
         })
+        # Recalc replenishment/standard cost so dual-vendor glue (or
+        # main-seller logic) can switch to ELIT when it has stock.
+        self._gn_update_cost_all_companies(missing_products)
         _logger.info(
             "Grupo Núcleo stock cleanup: set stock_gn=0 for %d missing products",
             len(missing_products),
